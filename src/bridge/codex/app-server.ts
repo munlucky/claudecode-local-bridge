@@ -31,7 +31,7 @@ type PendingRequest = {
 }
 
 export interface CodexTurnMetadata {
-	conversationId: string
+	threadId: string
 	workspaceRoot: string
 }
 
@@ -108,6 +108,28 @@ function getTurnUsage(params: Record<string, unknown> | undefined): CodexTokenUs
 	return last ? normalizeUsage(last) : null
 }
 
+function getItemText(item: Record<string, unknown> | null): string | null {
+	const direct = getString(item?.text)
+	if (direct) {
+		return direct
+	}
+
+	const content = Array.isArray(item?.content) ? item.content : null
+	if (!content) {
+		return null
+	}
+
+	const text = content
+		.map((part) => {
+			const block = getObject(part)
+			return getString(block?.text)
+		})
+		.filter((value): value is string => Boolean(value))
+		.join('')
+
+	return text.length > 0 ? text : null
+}
+
 function formatSse(event: string, payload: unknown): Uint8Array {
 	return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
 }
@@ -177,20 +199,28 @@ function buildSandboxPolicy(
 	return sandboxMode
 }
 
-function buildSandboxObject(
+function buildTurnSandboxPolicy(
 	sandboxMode: RouterConfig['codexSandboxMode'],
-): { type: 'read-only' } | { type: 'workspace-write'; network_access: boolean; exclude_tmpdir_env_var: boolean; exclude_slash_tmp: boolean } | { type: 'danger-full-access' } {
+):
+	| { type: 'readOnly' }
+	| {
+			type: 'workspaceWrite'
+			networkAccess: boolean
+			excludeTmpdirEnvVar: boolean
+			excludeSlashTmp: boolean
+	  }
+	| { type: 'dangerFullAccess' } {
 	switch (sandboxMode) {
 		case 'read-only':
-			return { type: 'read-only' }
+			return { type: 'readOnly' }
 		case 'danger-full-access':
-			return { type: 'danger-full-access' }
+			return { type: 'dangerFullAccess' }
 		default:
 			return {
-				type: 'workspace-write',
-				network_access: true,
-				exclude_tmpdir_env_var: false,
-				exclude_slash_tmp: false,
+				type: 'workspaceWrite',
+				networkAccess: true,
+				excludeTmpdirEnvVar: false,
+				excludeSlashTmp: false,
 			}
 	}
 }
@@ -369,7 +399,7 @@ async function createPreparedSession(
 	request: AnthropicMessagesRequest,
 ): Promise<{
 	session: CodexAppServerSession
-	conversationId: string
+	threadId: string
 	model: string
 	reasoningEffort: string | null
 	workspaceRoot: string
@@ -401,45 +431,32 @@ async function createPreparedSession(
 	}
 
 	const targetModel = resolveModelAlias(config, request.model)
-	const newConversation = await session.request(
-		'newConversation',
+	const threadStart = await session.request(
+		'thread/start',
 		{
 			model: targetModel,
-			modelProvider: null,
-			profile: null,
 			cwd: workspaceRoot,
 			approvalPolicy: 'never',
 			sandbox: buildSandboxPolicy(config.codexSandboxMode),
-			config: null,
 			baseInstructions:
 				'You are serving as an Anthropic-compatible backend through a local bridge.',
 			developerInstructions: buildCodexDeveloperInstructions(request),
-			compactPrompt: null,
-			includeApplyPatchTool: null,
 		},
 		config.codexInitTimeoutMs,
 	)
 
-	const conversationId = getString(newConversation.conversationId)
-	if (!conversationId) {
+	const thread = getObject(threadStart.thread)
+	const threadId = getString(thread?.id)
+	if (!threadId) {
 		session.close()
-		throw new Error('newConversation 응답에 conversationId 가 없습니다.')
+		throw new Error('thread/start 응답에 thread.id 가 없습니다.')
 	}
-
-	await session.request(
-		'addConversationListener',
-		{
-			conversationId,
-			experimentalRawEvents: true,
-		},
-		config.codexInitTimeoutMs,
-	)
 
 	return {
 		session,
-		conversationId,
-		model: getString(newConversation.model) ?? targetModel,
-		reasoningEffort: getString(newConversation.reasoningEffort),
+		threadId,
+		model: getString(threadStart.model) ?? targetModel,
+		reasoningEffort: getString(threadStart.reasoningEffort),
 		workspaceRoot,
 		cleanup: async () => {},
 	}
@@ -458,30 +475,23 @@ function normalizeEffort(value: string | null): string {
 	}
 }
 
-function buildSendUserTurnParams(
-	conversationId: string,
-	model: string,
+function buildTurnStartParams(
+	threadId: string,
 	reasoningEffort: string | null,
-	workspaceRoot: string,
 	config: RouterConfig,
 	request: AnthropicMessagesRequest,
 ): Record<string, unknown> {
 	return {
-		conversationId,
-		items: [
+		threadId,
+		input: [
 			{
 				type: 'text',
-				data: {
-					text: serializeAnthropicRequestToCodexPrompt(request),
-				},
+				text: serializeAnthropicRequestToCodexPrompt(request),
 			},
 		],
-		cwd: workspaceRoot,
 		approvalPolicy: 'never',
-		sandboxPolicy: buildSandboxObject(config.codexSandboxMode),
-		model,
+		sandboxPolicy: buildTurnSandboxPolicy(config.codexSandboxMode),
 		effort: normalizeEffort(reasoningEffort),
-		summary: 'none',
 		outputSchema: null as JsonValue | null,
 	}
 }
@@ -524,7 +534,7 @@ export async function executeCodexTurn(
 			if (method === 'item/completed') {
 				const item = getObject(params?.item)
 				if (item?.type === 'agentMessage') {
-					finalText = getString(item.text) ?? finalText
+					finalText = getItemText(item) ?? finalText
 				}
 				return
 			}
@@ -549,12 +559,10 @@ export async function executeCodexTurn(
 		})
 
 		await prepared.session.request(
-			'sendUserTurn',
-			buildSendUserTurnParams(
-				prepared.conversationId,
-				prepared.model,
+			'turn/start',
+			buildTurnStartParams(
+				prepared.threadId,
 				prepared.reasoningEffort,
-				prepared.workspaceRoot,
 				config,
 				request,
 			),
@@ -627,7 +635,7 @@ export function createCodexAnthropicStream(
 
 				prepared = await createPreparedSession(config, request)
 				await logger?.onSessionReady?.({
-					conversationId: prepared.conversationId,
+					threadId: prepared.threadId,
 					workspaceRoot: prepared.workspaceRoot,
 					model: prepared.model,
 				})
@@ -707,7 +715,7 @@ export function createCodexAnthropicStream(
 					if (method === 'item/completed') {
 						const item = getObject(params?.item)
 						if (item?.type === 'agentMessage') {
-							finalText = getString(item.text) ?? finalText
+							finalText = getItemText(item) ?? finalText
 						}
 						return
 					}
@@ -810,7 +818,7 @@ export function createCodexAnthropicStream(
 									finalText,
 									decision,
 									metadata: {
-										conversationId: activePrepared.conversationId,
+										threadId: activePrepared.threadId,
 										workspaceRoot: activePrepared.workspaceRoot,
 										model: activePrepared.model,
 									},
@@ -896,7 +904,7 @@ export function createCodexAnthropicStream(
 								? parseCodexBridgeDecision(finalText, request)
 								: null,
 							metadata: {
-								conversationId: activePrepared.conversationId,
+								threadId: activePrepared.threadId,
 								workspaceRoot: activePrepared.workspaceRoot,
 								model: activePrepared.model,
 							},
@@ -907,12 +915,10 @@ export function createCodexAnthropicStream(
 				})
 
 				await prepared.session.request(
-					'sendUserTurn',
-					buildSendUserTurnParams(
-						prepared.conversationId,
-						prepared.model,
+					'turn/start',
+					buildTurnStartParams(
+						prepared.threadId,
 						prepared.reasoningEffort,
-						prepared.workspaceRoot,
 						config,
 						request,
 					),
@@ -934,7 +940,7 @@ export function createCodexAnthropicStream(
 					error,
 					metadata: prepared
 						? {
-								conversationId: prepared.conversationId,
+								threadId: prepared.threadId,
 								workspaceRoot: prepared.workspaceRoot,
 								model: prepared.model,
 							}
@@ -966,7 +972,7 @@ export function createCodexAnthropicStream(
 			void logger?.onCancel?.({
 				metadata: prepared
 					? {
-							conversationId: prepared.conversationId,
+							threadId: prepared.threadId,
 							workspaceRoot: prepared.workspaceRoot,
 							model: prepared.model,
 						}

@@ -234,7 +234,7 @@ export function createApp() {
 				const stream = createAnthropicStream(config, requestBody, {
 					onSessionReady: async (metadata) => {
 						logRouterLine(
-							`stream session_ready request_id=${traceContext.router_request_id} conversation_id=${metadata.conversationId} model=${metadata.model}`,
+							`stream session_ready request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} model=${metadata.model}`,
 						)
 					},
 					onComplete: async ({ stopReason, usage, decision, metadata }) => {
@@ -244,14 +244,14 @@ export function createApp() {
 							duration_ms: Date.now() - startedAt,
 							stream_end_reason: stopReason,
 							codex_model: metadata.model,
-							conversation_id: metadata.conversationId,
+							conversation_id: metadata.threadId,
 							usage_output_tokens: usage.outputTokens,
 							decision_kind: decision?.kind ?? null,
 							tool_use_name:
 								decision?.kind === 'tool_use' ? decision.name : null,
 						})
 						logRouterLine(
-							`stream completed request_id=${traceContext.router_request_id} conversation_id=${metadata.conversationId} end_reason=${stopReason} tool=${decision?.kind === 'tool_use' ? decision.name : 'none'} output_tokens=${usage.outputTokens}`,
+							`stream completed request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} end_reason=${stopReason} tool=${decision?.kind === 'tool_use' ? decision.name : 'none'} output_tokens=${usage.outputTokens}`,
 						)
 					},
 					onError: async ({ error, metadata }) => {
@@ -263,10 +263,10 @@ export function createApp() {
 							stream_end_reason: 'error',
 							error_message: message,
 							codex_model: metadata?.model ?? null,
-							conversation_id: metadata?.conversationId ?? null,
+							conversation_id: metadata?.threadId ?? null,
 						})
 						logRouterLine(
-							`stream failed request_id=${traceContext.router_request_id} conversation_id=${metadata?.conversationId ?? 'none'} error=${JSON.stringify(message)}`,
+							`stream failed request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)}`,
 						)
 					},
 					onCancel: async ({ metadata }) => {
@@ -276,10 +276,10 @@ export function createApp() {
 							duration_ms: Date.now() - startedAt,
 							stream_end_reason: 'cancelled',
 							codex_model: metadata?.model ?? null,
-							conversation_id: metadata?.conversationId ?? null,
+							conversation_id: metadata?.threadId ?? null,
 						})
 						logRouterLine(
-							`stream cancelled request_id=${traceContext.router_request_id} conversation_id=${metadata?.conversationId ?? 'none'}`,
+							`stream cancelled request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'}`,
 						)
 					},
 				})

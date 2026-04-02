@@ -118,8 +118,8 @@ ROUTER_CAPTURE_RESPONSES=0
 
 1. Claude Code가 보낸 Anthropic Messages 요청을 받습니다.
 2. 요청 본문을 검증하고 정규화합니다.
-3. `codex app-server`를 통해 Codex conversation을 시작합니다.
-4. 직렬화된 turn을 Codex로 전달합니다.
+3. `codex app-server`의 `thread/start`로 Codex thread를 시작합니다.
+4. `turn/start`로 직렬화된 요청을 Codex에 전달합니다.
 5. 결과를 Anthropic 호환 JSON 또는 SSE로 변환합니다.
 6. 최종 텍스트 응답 또는 다음 `tool_use` 결정을 반환합니다.
 
@@ -156,7 +156,7 @@ dist/
 - `codex app-server`의 로컬 프로토콜에 의존하며, 공개 안정 API 계약이 아닙니다.
 - 로컬 Codex 인증 기반 브리지 경로만 지원합니다.
 - Inbound Anthropic bearer token은 검증하지 않습니다.
-- 요청마다 새 Codex conversation을 만들고, 문맥은 들어온 transcript로 재구성합니다.
+- 요청마다 새 Codex thread를 만들고, 문맥은 들어온 transcript로 재구성합니다.
 
 ## 개발
 
