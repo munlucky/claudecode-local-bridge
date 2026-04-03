@@ -3,7 +3,7 @@ import { Hono } from 'hono'
 import { z } from 'zod'
 import { loadConfig } from './config.js'
 import { mapCodexResultToAnthropic } from '../bridge/anthropic/index.js'
-import { AuthConfigurationError, executeCodexTurn } from '../bridge/codex/index.js'
+import { AuthConfigurationError, checkCodexAuthDependency, executeCodexTurn } from '../bridge/codex/index.js'
 import {
 	captureAnthropicRequest,
 	buildRouterTraceContext,
@@ -132,6 +132,56 @@ function buildErrorResponse(message: string, statusCode: number, routerRequestId
 export function createApp() {
 	const config = loadConfig()
 	const app = new Hono()
+	const AUTH_MODE_DEPENDENCY_TTL_MS = 30 * 1000
+	const AUTH_MODE_DEPENDENCY_TIMEOUT_MS = 1500
+	const authModeDependencyCache = {
+		value: true,
+		checkedAt: 0,
+		inflight: null as Promise<boolean> | null,
+	}
+
+	function getAuthModeDependencyState(
+		config: RouterConfig,
+	): RouterHealthResponse['has_auth_mode_dependency'] | Promise<RouterHealthResponse['has_auth_mode_dependency']> {
+		switch (config.codexAuthMode) {
+			case 'api_key':
+				return Boolean(config.codexOpenAiApiKey)
+			case 'local_auth_json':
+				return existsSync(config.codexAuthFile)
+			case 'account':
+				if (
+					authModeDependencyCache.checkedAt > 0 &&
+					Date.now() - authModeDependencyCache.checkedAt <= AUTH_MODE_DEPENDENCY_TTL_MS &&
+					!authModeDependencyCache.inflight
+				) {
+					return authModeDependencyCache.value
+				}
+
+				if (!authModeDependencyCache.inflight) {
+					authModeDependencyCache.inflight = checkCodexAuthDependency(
+						config,
+						AUTH_MODE_DEPENDENCY_TIMEOUT_MS,
+					)
+						.then((result) => {
+							authModeDependencyCache.value = result
+							authModeDependencyCache.checkedAt = Date.now()
+							return result
+						})
+						.catch(() => {
+							authModeDependencyCache.value = false
+							authModeDependencyCache.checkedAt = Date.now()
+							return false
+						})
+						.finally(() => {
+							authModeDependencyCache.inflight = null
+						})
+				}
+
+				return authModeDependencyCache.inflight
+			default:
+				return true
+		}
+	}
 
 	if (config.logRequests) {
 		app.use('*', async (c, next) => {
@@ -146,7 +196,9 @@ export function createApp() {
 
 	app.get('/', (c) => c.redirect('/health'))
 
-	app.get('/health', (c) => {
+	app.get('/health', async (c) => {
+		const hasLocalAuthFile = existsSync(config.codexAuthFile)
+		const hasAuthModeDependency = await getAuthModeDependencyState(config)
 		const body: RouterHealthResponse = {
 			status: 'ok',
 			backend: 'codex_app_server',
@@ -154,10 +206,22 @@ export function createApp() {
 			codex_command: config.codexCommand,
 			codex_runtime_cwd: config.codexRuntimeCwd,
 			codex_auth_file: config.codexAuthFile,
-			has_local_auth_file: existsSync(config.codexAuthFile),
+			has_local_auth_file: hasLocalAuthFile,
+			has_auth_mode_dependency: hasAuthModeDependency,
 		}
 
-		return c.json(body)
+		const isHealthy = Boolean(hasAuthModeDependency)
+		if (!isHealthy) {
+			if (config.codexAuthMode === 'local_auth_json' && !hasLocalAuthFile) {
+				logRouterLine(
+					`health auth dependency check failed: local_auth_json missing auth file path=${config.codexAuthFile}`,
+				)
+			} else if (config.codexAuthMode === 'account') {
+				logRouterLine('health auth dependency check failed: account auth probe returned false')
+			}
+		}
+
+		return c.json(body, isHealthy ? 200 : 503)
 	})
 
 	app.get('/v1/models', (c) => {

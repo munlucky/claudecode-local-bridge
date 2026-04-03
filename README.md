@@ -18,8 +18,10 @@
 
 - [Bun](https://bun.sh/) `>= 1.1`
 - `PATH`에 등록된 `codex` 실행 파일
-- 유효한 로컬 Codex 인증 파일
-  기본값: `~/.codex/auth.json`
+- 인증 모드 설정(`CODEX_AUTH_MODE`)에 맞는 인증 준비
+- `local_auth_json` 모드: `~/.codex/auth.json` 또는 `CODEX_AUTH_FILE`에 유효한 인증 파일 필요
+- `account` 모드: `account/read` 계정 인증을 앱 서버가 자체 확인
+- `api_key` 모드: `CODEX_OPENAI_API_KEY` 또는 `OPENAI_API_KEY` 필요
 
 ## 빠른 시작
 
@@ -75,10 +77,13 @@ ANTHROPIC_API_KEY=
 | --- | --- | --- |
 | `ROUTER_LISTEN_HOST` | `127.0.0.1` | 바인드 주소 |
 | `ROUTER_LISTEN_PORT` | `3000` | HTTP 포트 |
+| `CODEX_AUTH_MODE` | `local_auth_json` | 인증 모드 (`disabled`, `local_auth_json`, `account`, `api_key`) |
 | `CODEX_AUTH_FILE` | `~/.codex/auth.json` | 로컬 Codex 인증 파일 경로 |
+| `CODEX_OPENAI_API_KEY` | 미설정 | `api_key` 모드에서 직접 사용할 OpenAI API 키 |
 | `CODEX_RUNTIME_CWD` | `~/.codex/bridge-runtime` | Codex가 작업하는 기본 디렉터리 |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex 파일/쉘 권한 수준 |
 | `CODEX_TURN_TIMEOUT_MS` | `180000` | Codex 한 턴 최대 실행 시간 |
+| `CODEX_TURN_REQUEST_TIMEOUT_MS` | `180000` | `turn/start` 요청만의 타임아웃 |
 | `ROUTER_IDLE_TIMEOUT_SEC` | `185` | SSE 유휴 타임아웃 |
 | `MODEL_ALIASES_JSON` | 미설정 | Anthropic 모델 ID와 Codex 모델 매핑 덮어쓰기 |
 
@@ -127,7 +132,32 @@ jq -r '
 
 ### `GET /health`
 
-런타임 상태, 인증 모드, 실행 명령, 로컬 인증 파일 존재 여부를 반환합니다.
+런타임 상태, 인증 모드, 실행 명령, 인증 준비 의존성 상태를 반환합니다.
+
+응답 예시(예: `/health`):
+
+```json
+{
+  "status": "ok",
+  "backend": "codex_app_server",
+  "auth_mode": "local_auth_json",
+  "codex_command": "codex",
+  "codex_runtime_cwd": "/Users/me/.codex/bridge-runtime",
+  "codex_auth_file": "/Users/me/.codex/auth.json",
+  "has_local_auth_file": true,
+  "has_auth_mode_dependency": true
+}
+```
+
+`has_local_auth_file`는 `CODEX_AUTH_FILE` 존재 여부만 나타내며,  
+`has_auth_mode_dependency`는 현재 `CODEX_AUTH_MODE` 기준으로 실제 인증 선행 조건 충족 여부를 의미합니다.
+- `local_auth_json`: 인증 파일 존재 여부
+- `api_key`: `CODEX_OPENAI_API_KEY` 또는 `OPENAI_API_KEY` 존재 여부
+- `account`: `account/read` 또는 구버전 `getAuthStatus` 호출로 실제 인증 존재 여부 판정
+- `disabled`: `true`
+
+`/health`는 위 항목이 `false`이면 503(서비스 점검)으로 반환됩니다.  
+`local_auth_json`에서 인증 파일이 없으면 시작 로그에 경고가 기록됩니다.
 
 ### `GET /v1/models`
 
@@ -187,7 +217,7 @@ dist/
 
 - 로컬 사용 전제입니다. 외부 인터넷에 직접 노출하면 안 됩니다.
 - `codex app-server`의 로컬 프로토콜에 의존하며, 공개 안정 API 계약이 아닙니다.
-- 로컬 Codex 인증 기반 브리지 경로만 지원합니다.
+- 인증은 Codex app-server 세션 기준이며 `local_auth_json`/`account`/`api_key` 모드를 지원합니다.
 - Inbound Anthropic bearer token은 검증하지 않습니다.
 - `x-claude-code-session-id`가 있으면 동일 workspace 안에서 Codex app-server 세션과 thread를 재사용합니다.
 - 구버전 Claude Code처럼 session header가 없는 경우에는 동일 workspace + 동일 CLI user agent + 요청에서 추출한 대화 seed에 대해 짧은 TTL 기반 fallback 재사용을 시도합니다.

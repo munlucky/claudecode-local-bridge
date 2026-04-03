@@ -505,6 +505,8 @@ function buildTurnSandboxPolicy(
 	}
 }
 
+const ALLOWED_AUTH_METHODS = ['chatgpt', 'chatgptAuthTokens', 'chatgpt_auth_tokens'] as const
+
 class CodexAppServerSession {
 	private readonly process: ReturnType<typeof Bun.spawn>
 	private readonly encoder = new TextEncoder()
@@ -517,11 +519,16 @@ class CodexAppServerSession {
 
 	private constructor(config: RouterConfig) {
 		const executable = Bun.which(config.codexCommand) ?? config.codexCommand
+		const env = { ...process.env }
+		if (config.codexOpenAiApiKey) {
+			env.OPENAI_API_KEY = config.codexOpenAiApiKey
+		}
+
 		this.process = Bun.spawn([executable, 'app-server'], {
 			stdin: 'pipe',
 			stdout: 'pipe',
 			stderr: 'pipe',
-			env: process.env,
+			env,
 		})
 		this.processStdout()
 		this.processStderr()
@@ -532,17 +539,23 @@ class CodexAppServerSession {
 
 	static async create(config: RouterConfig): Promise<CodexAppServerSession> {
 		const session = new CodexAppServerSession(config)
-		await session.request(
-			'initialize',
-			{
-				clientInfo: {
-					name: 'claudecode-codex-local-bridge',
-					version: '2.0.0',
+		try {
+			await session.request(
+				'initialize',
+				{
+					clientInfo: {
+						name: 'claudecode-codex-local-bridge',
+						version: '2.0.0',
+					},
 				},
-			},
-			config.codexInitTimeoutMs,
-		)
-		return session
+				config.codexInitTimeoutMs,
+			)
+			session.notify('initialized', {})
+			return session
+		} catch (error) {
+			session.close()
+			throw error
+		}
 	}
 
 	private processStdout() {
@@ -621,6 +634,16 @@ class CodexAppServerSession {
 		}
 	}
 
+	notify(method: string, params: Record<string, unknown>) {
+		if (this.closed) {
+			throw new Error('codex app-server 세션이 닫혔습니다.')
+		}
+
+		getWritableStdin(this.process.stdin).write(
+			this.encoder.encode(`${JSON.stringify({ method, params })}\n`),
+		)
+	}
+
 	private failAll(error: Error) {
 		this.closed = true
 		for (const pending of this.pending.values()) {
@@ -678,6 +701,123 @@ class CodexAppServerSession {
 	}
 }
 
+function isLegacyAuthMethodAllowed(value: unknown): value is (typeof ALLOWED_AUTH_METHODS)[number] {
+	const authMethod = getString(value)
+	return authMethod !== null && ALLOWED_AUTH_METHODS.includes(authMethod)
+}
+
+function hasAccountIdentity(value: unknown): boolean {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return false
+	}
+
+	const object = value as Record<string, unknown>
+	if (getString(object.account_id) || getString(object.id) || getString(object.email)) {
+		return true
+	}
+
+	const account = getObject(object.account)
+	if (!account) {
+		return Object.keys(object).length > 0
+	}
+
+	return getString(account.account_id) || getString(account.id) || getString(account.email)
+}
+
+async function hasAccountSession(session: CodexAppServerSession, timeoutMs: number): Promise<boolean> {
+	try {
+		const accountRead = await session.request('account/read', {}, timeoutMs)
+		return hasAccountIdentity(accountRead.account) || hasAccountIdentity(accountRead)
+	} catch {
+		return false
+	}
+}
+
+async function hasLegacySession(session: CodexAppServerSession, timeoutMs: number): Promise<boolean> {
+	try {
+		const authStatus = await session.request(
+			'getAuthStatus',
+			{
+				includeToken: false,
+				refreshToken: true,
+			},
+			timeoutMs,
+		)
+		const authMethod = authStatus.authMethod
+		return isLegacyAuthMethodAllowed(authMethod)
+	} catch {
+		return false
+	}
+}
+
+export async function checkCodexAuthDependency(
+	config: RouterConfig,
+	timeoutMs = 1500,
+): Promise<boolean> {
+	let session: CodexAppServerSession | null = null
+	try {
+		session = await CodexAppServerSession.create(config)
+		const accountResult = await hasAccountSession(session, timeoutMs)
+		if (accountResult) {
+			return true
+		}
+
+		return await hasLegacySession(session, timeoutMs)
+	} catch {
+		return false
+	} finally {
+		session?.close()
+	}
+}
+
+function buildAuthErrorMessage(config: RouterConfig): string {
+	switch (config.codexAuthMode) {
+		case 'api_key':
+			return 'CODEX_OPENAI_API_KEY(또는 OPENAI_API_KEY)가 필요합니다.'
+		case 'account':
+			return 'Codex account 인증이 필요합니다. account/read/login 흐름을 확인하세요.'
+		case 'local_auth_json':
+			return 'Codex local auth 상태가 활성화되어 있지 않습니다.'
+		default:
+			return 'Codex 인증 정보가 충분하지 않습니다.'
+	}
+}
+
+async function requireCodexAuthReady(
+	session: CodexAppServerSession,
+	config: RouterConfig,
+): Promise<void> {
+	const needsOpenAiApiKey = config.codexAuthMode === 'api_key'
+	const needsLocalFile = config.codexAuthMode === 'local_auth_json'
+
+	if (needsLocalFile) {
+		await requireCodexLocalAuthFile(config.codexAuthFile)
+	}
+
+	if (needsOpenAiApiKey) {
+		if (!config.codexOpenAiApiKey) {
+			throw new AuthConfigurationError(buildAuthErrorMessage(config))
+		}
+		return
+	}
+
+	if (config.codexAuthMode === 'disabled') {
+		return
+	}
+
+	const hasAccount = await hasAccountSession(session, config.codexInitTimeoutMs)
+	if (hasAccount) {
+		return
+	}
+
+	const hasLegacy = await hasLegacySession(session, config.codexInitTimeoutMs)
+	if (hasLegacy) {
+		return
+	}
+
+	throw new AuthConfigurationError(buildAuthErrorMessage(config))
+}
+
 async function startThread(
 	session: CodexAppServerSession,
 	config: RouterConfig,
@@ -718,22 +858,10 @@ async function createCachedSession(
 	config: RouterConfig,
 ): Promise<CodexAppServerSession> {
 	const session = await CodexAppServerSession.create(config)
-	const authStatus = await session.request(
-		'getAuthStatus',
-		{
-			includeToken: false,
-			refreshToken: true,
-		},
-		config.codexInitTimeoutMs,
-	)
-
-	if (authStatus.authMethod !== 'chatgpt') {
-		session.close()
-		throw new AuthConfigurationError('Codex local auth 상태가 활성화되어 있지 않습니다.')
-	}
-
+	await requireCodexAuthReady(session, config)
 	return session
 }
+
 
 async function createThreadCacheRecord(
 	config: RouterConfig,
@@ -854,13 +982,6 @@ async function createPreparedSession(
 		forceFreshThread?: boolean
 	},
 ): Promise<PreparedSession> {
-	if (config.codexAuthMode !== 'local_auth_json') {
-		throw new AuthConfigurationError(
-			'이 프로젝트는 CODEX_AUTH_MODE=local_auth_json 전용으로 동작합니다.',
-		)
-	}
-
-	await requireCodexLocalAuthFile(config.codexAuthFile)
 	await mkdir(config.codexRuntimeCwd, { recursive: true })
 	const workspaceRoot = inferWorkspaceRoot(config, request)
 	const requestContext = normalizeRequestContext(context)
@@ -1204,7 +1325,7 @@ async function executePreparedTurn(
 					config,
 					prepared.promptText,
 				),
-				config.codexInitTimeoutMs,
+				config.codexTurnRequestTimeoutMs,
 			)
 		} catch (error) {
 			unsubscribe()
@@ -1576,7 +1697,7 @@ export function createCodexAnthropicStream(
 									config,
 									prepared.promptText,
 								),
-								config.codexInitTimeoutMs,
+								config.codexTurnRequestTimeoutMs,
 							)
 						} catch (error) {
 							unsubscribe?.()

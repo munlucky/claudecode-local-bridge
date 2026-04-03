@@ -182,9 +182,10 @@ export interface CodexTurnResult {
 export interface RouterHealthResponse {
 	status: 'ok'
 	backend: 'codex_app_server'
-	auth_mode: 'api_key' | 'local_auth_json' | 'disabled'
+	auth_mode: 'api_key' | 'account' | 'local_auth_json' | 'disabled'
 	codex_command: string
 	codex_runtime_cwd: string
 	codex_auth_file: string
 	has_local_auth_file: boolean
+	has_auth_mode_dependency: boolean
 }

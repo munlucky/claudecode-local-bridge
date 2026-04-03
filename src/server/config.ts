@@ -5,12 +5,14 @@ export interface RouterConfig {
 	listenHost: string
 	listenPort: number
 	codexCommand: string
-	codexAuthMode: 'disabled' | 'local_auth_json'
+	codexAuthMode: 'disabled' | 'local_auth_json' | 'account' | 'api_key'
 	codexAuthFile: string
+	codexOpenAiApiKey: string | null
 	codexRuntimeCwd: string
 	codexSandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access'
 	codexInitTimeoutMs: number
 	codexTurnTimeoutMs: number
+	codexTurnRequestTimeoutMs: number
 	serverIdleTimeoutSec: number
 	userAgent: string
 	logRequests: boolean
@@ -82,12 +84,21 @@ function parseSandboxMode(
 	}
 }
 
-function parseCodexAuthMode(value: string | undefined): 'disabled' | 'local_auth_json' {
+function parseCodexAuthMode(
+	value: string | undefined,
+): 'disabled' | 'local_auth_json' | 'account' | 'api_key' {
 	switch (value?.trim()) {
 		case 'disabled':
 			return 'disabled'
 		case 'local_auth_json':
 			return 'local_auth_json'
+		case 'account':
+		case 'chatgpt':
+			return 'account'
+		case 'api_key':
+		case 'apikey':
+		case 'openai_api_key':
+			return 'api_key'
 		default:
 			return 'local_auth_json'
 	}
@@ -123,6 +134,9 @@ function parseModelAliases(): Record<string, string> {
 
 export function loadConfig(): RouterConfig {
 	const apiTimeoutMs = parseTimeout(process.env.API_TIMEOUT_MS, 180000)
+	const codexOpenAiApiKey =
+		trimToNull(process.env.CODEX_OPENAI_API_KEY) ?? trimToNull(process.env.OPENAI_API_KEY)
+	const codexTurnTimeoutMs = parseTimeout(process.env.CODEX_TURN_TIMEOUT_MS, apiTimeoutMs)
 
 	return {
 		listenHost: process.env.ROUTER_LISTEN_HOST?.trim() || '127.0.0.1',
@@ -130,12 +144,17 @@ export function loadConfig(): RouterConfig {
 		codexCommand: process.env.CODEX_COMMAND?.trim() || 'codex',
 		codexAuthMode: parseCodexAuthMode(process.env.CODEX_AUTH_MODE),
 		codexAuthFile: expandHomePath(process.env.CODEX_AUTH_FILE?.trim() || '~/.codex/auth.json'),
+		codexOpenAiApiKey,
 		codexRuntimeCwd: expandHomePath(
 			process.env.CODEX_RUNTIME_CWD?.trim() || '~/.codex/bridge-runtime',
 		),
 		codexSandboxMode: parseSandboxMode(process.env.CODEX_SANDBOX_MODE),
 		codexInitTimeoutMs: parseTimeout(process.env.CODEX_INIT_TIMEOUT_MS, 15000),
-		codexTurnTimeoutMs: parseTimeout(process.env.CODEX_TURN_TIMEOUT_MS, apiTimeoutMs),
+		codexTurnTimeoutMs,
+		codexTurnRequestTimeoutMs: parseTimeout(
+			process.env.CODEX_TURN_REQUEST_TIMEOUT_MS,
+			codexTurnTimeoutMs,
+		),
 		serverIdleTimeoutSec: parseHeartbeatSeconds(
 			process.env.ROUTER_IDLE_TIMEOUT_SEC,
 			deriveIdleTimeoutSec(apiTimeoutMs),
