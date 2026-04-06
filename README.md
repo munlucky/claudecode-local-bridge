@@ -86,6 +86,14 @@ OLLAMA_MODEL=qwen3.5:27b
 bun run start
 ```
 
+Ollama/qwen 연동 점검(응답 저장 포함):
+
+```powershell
+node scripts/verify-ollama-bridge.mjs --base http://127.0.0.1:3000 --model qwen3.5:27b
+```
+
+점검 결과는 `.bridge-qa/<timestamp>/` 아래에 요청/응답/스트리밍 청크/요약본으로 저장됩니다.
+
 ## 설정
 
 `.env.template`을 복사한 뒤 필요한 값만 조정하면 됩니다.
