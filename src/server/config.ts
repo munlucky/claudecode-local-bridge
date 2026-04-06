@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 export interface RouterConfig {
 	listenHost: string
 	listenPort: number
+	bridgeBackend: 'codex' | 'ollama'
 	codexCommand: string
 	codexAuthMode: 'disabled' | 'local_auth_json' | 'account' | 'api_key'
 	codexAuthFile: string
@@ -24,6 +25,11 @@ export interface RouterConfig {
 	captureRetentionDays: number
 	heartbeatIntervalSec: number
 	modelAliases: Record<string, string>
+	ollamaBaseUrl: string
+	ollamaModel: string
+	ollamaApiKey: string | null
+	ollamaRequestTimeoutMs: number
+	ollamaShowThinking: boolean
 }
 
 function trimToNull(value: string | undefined): string | null {
@@ -111,6 +117,17 @@ function parseCodexAuthMode(
 	}
 }
 
+function parseBridgeBackend(value: string | undefined): 'codex' | 'ollama' {
+	switch (value?.trim().toLowerCase()) {
+		case 'ollama':
+		case 'ollama_api':
+		case 'qwen':
+			return 'ollama'
+		default:
+			return 'codex'
+	}
+}
+
 function parseModelAliases(): Record<string, string> {
 	const aliases: Record<string, string> = {
 		'claude-opus-4-1-20250805': process.env.CODEX_MODEL_OPUS?.trim() || 'gpt-5.4',
@@ -144,10 +161,14 @@ export function loadConfig(): RouterConfig {
 	const codexOpenAiApiKey =
 		trimToNull(process.env.CODEX_OPENAI_API_KEY) ?? trimToNull(process.env.OPENAI_API_KEY)
 	const codexTurnTimeoutMs = parseTimeout(process.env.CODEX_TURN_TIMEOUT_MS, apiTimeoutMs)
+	const bridgeBackend = parseBridgeBackend(process.env.BRIDGE_BACKEND)
+	const ollamaBaseUrl = trimToNull(process.env.OLLAMA_BASE_URL) ?? 'http://127.0.0.1:11434'
+	const ollamaApiKey = trimToNull(process.env.OLLAMA_API_KEY)
 
 	return {
 		listenHost: process.env.ROUTER_LISTEN_HOST?.trim() || '127.0.0.1',
 		listenPort: parsePort(process.env.ROUTER_LISTEN_PORT, 3000),
+		bridgeBackend,
 		codexCommand: process.env.CODEX_COMMAND?.trim() || 'codex',
 		codexAuthMode: parseCodexAuthMode(process.env.CODEX_AUTH_MODE),
 		codexAuthFile: expandHomePath(process.env.CODEX_AUTH_FILE?.trim() || '~/.codex/auth.json'),
@@ -191,5 +212,10 @@ export function loadConfig(): RouterConfig {
 			30,
 		),
 		modelAliases: parseModelAliases(),
+		ollamaBaseUrl,
+		ollamaModel: trimToNull(process.env.OLLAMA_MODEL) || 'qwen3.5:27b',
+		ollamaApiKey,
+		ollamaRequestTimeoutMs: parseTimeout(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 120000),
+		ollamaShowThinking: parseBoolean(process.env.OLLAMA_SHOW_THINKING, false),
 	}
 }

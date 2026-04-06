@@ -1,0 +1,29 @@
+{
+  "model": "qwen3.5:27b",
+  "created_at": "2026-04-06T01:52:01.344701668Z",
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "thinking": "사용자가 서울의 현재 날씨를 요청하고 있습니다. 제공된 도구 중 get_weather 함수를 사용하여 서울의 날씨 정보를 가져올 수 있습니다.",
+    "tool_calls": [
+      {
+        "id": "call_c9j2d4de",
+        "function": {
+          "index": 0,
+          "name": "get_weather",
+          "arguments": {
+            "city": "서울"
+          }
+        }
+      }
+    ]
+  },
+  "done": true,
+  "done_reason": "stop",
+  "total_duration": 1905533670,
+  "load_duration": 207097275,
+  "prompt_eval_count": 167,
+  "prompt_eval_duration": 227317200,
+  "eval_count": 53,
+  "eval_duration": 1329498126
+}

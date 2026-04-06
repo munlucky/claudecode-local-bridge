@@ -1,0 +1,31 @@
+{
+  "model": "qwen3.5:27b",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "서울 날씨를 알려줘"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -49,11 +49,16 @@ bun run start
 bun run dev
 ```
 
-기본 엔드포인트:
+멀티 백엔드 엔드포인트:
 
 - `http://127.0.0.1:3000/health`
-- `http://127.0.0.1:3000/v1/models`
-- `http://127.0.0.1:3000/v1/messages`
+ - `http://127.0.0.1:3000/v1/models`
+ - `http://127.0.0.1:3000/v1/messages`
+
+백엔드 기본값:
+
+- `BRIDGE_BACKEND=codex` (기본): 기존 로컬 Codex 앱서버 사용
+- `BRIDGE_BACKEND=ollama`: Ollama API 기반 사용 (`/api/tags`, `/api/chat`)
 
 ## Claude Code 연결
 
@@ -68,6 +73,19 @@ ANTHROPIC_API_KEY=
 브리지는 inbound Anthropic 토큰을 검증하지 않고, 실제 upstream 인증은 로컬 Codex 세션으로 처리합니다.
 반드시 `127.0.0.1` 또는 로컬 전용 인터페이스에만 바인딩해야 합니다.
 
+### Ollama backend 사용 예시
+
+```powershell
+Copy-Item .env.template .env
+@'
+BRIDGE_BACKEND=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3.5:27b
+'@ | Out-File -FilePath .env -Encoding utf8
+
+bun run start
+```
+
 ## 설정
 
 `.env.template`을 복사한 뒤 필요한 값만 조정하면 됩니다.
@@ -76,6 +94,7 @@ ANTHROPIC_API_KEY=
 
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
+| `BRIDGE_BACKEND` | `codex` | `codex` 또는 `ollama` |
 | `ROUTER_LISTEN_HOST` | `127.0.0.1` | 바인드 주소 |
 | `ROUTER_LISTEN_PORT` | `3000` | HTTP 포트 |
 | `CODEX_AUTH_MODE` | `local_auth_json` | 인증 모드 (`disabled`, `local_auth_json`, `account`, `api_key`) |
@@ -88,6 +107,11 @@ ANTHROPIC_API_KEY=
 | `ROUTER_IDLE_TIMEOUT_SEC` | `185` | SSE 유휴 타임아웃 |
 | `ROUTER_CAPTURE_MAX_FILE_BYTES` | `5242880` | 캡처 파일 rotate 기준 크기(byte) |
 | `ROUTER_CAPTURE_RETENTION_DAYS` | `7` | 캡처 파일 보존 일수 |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama 서버 주소 |
+| `OLLAMA_MODEL` | `qwen3.5:27b` | Ollama 기본 모델 |
+| `OLLAMA_API_KEY` | 미설정 | Ollama 인증키 (필요 시) |
+| `OLLAMA_REQUEST_TIMEOUT_MS` | `120000` | Ollama 요청 타임아웃(ms) |
+| `OLLAMA_SHOW_THINKING` | `0` | `message.thinking` 응답 포함 여부 (`1`이면 포함) |
 | `MODEL_ALIASES_JSON` | 미설정 | Anthropic 모델 ID와 Codex 모델 매핑 덮어쓰기 |
 
 디버그 로그와 요청/응답 캡처는 기본적으로 활성화되어 있습니다. `.history/` 아래에 로컬 추적 파일을 남기고 싶지 않다면 다음 값을 끄면 됩니다.
@@ -200,10 +224,16 @@ jq -r '
 
 1. Claude Code가 보낸 Anthropic Messages 요청을 받습니다.
 2. 요청 본문을 검증하고 정규화합니다.
-3. `x-claude-code-session-id`와 workspace가 있으면 기존 Codex app-server 세션과 thread를 재사용하고, 없으면 새 세션을 만들고 `thread/start`를 호출합니다.
-4. `turn/start`로 직렬화된 요청을 Codex에 전달합니다.
-5. 결과를 Anthropic 호환 JSON 또는 SSE로 변환합니다.
+3. `BRIDGE_BACKEND`에 따라 Codex 또는 Ollama provider로 라우팅합니다.
+4. Anthropic request/response를 provider 포맷으로 변환한 뒤 실행합니다.
+5. 결과를 Anthropic 호환 JSON 또는 SSE로 변환해 반환합니다.
 6. 최종 텍스트 응답 또는 다음 `tool_use` 결정을 반환합니다.
+
+지원 정책:
+
+- `thinking`은 기본적으로 응답 본문에서 제거됩니다.
+- `tool_calls`는 Anthropic `tool_use` 블록으로 정규화됩니다.
+- Ollama 스트리밍은 줄단위 JSON을 Anthropic SSE로 매핑합니다.
 
 ## 프로젝트 구조
 

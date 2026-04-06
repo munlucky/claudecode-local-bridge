@@ -1,481 +1,520 @@
 import { existsSync } from 'node:fs'
 import { Hono } from 'hono'
 import { z } from 'zod'
-import { loadConfig } from './config.js'
+import { checkCodexAuthDependency, getCodexBridgeRuntimeSnapshot } from '../bridge/codex/index.js'
+import { createBackendProvider } from '../bridge/backend-provider.js'
+import { AnthropicRequestValidationError, validateAnthropicRequestSemantics } from '../bridge/anthropic/index.js'
 import {
-	AnthropicRequestValidationError,
-	mapCodexResultToAnthropic,
-	validateAnthropicRequestSemantics,
-} from '../bridge/anthropic/index.js'
-import {
-	AuthConfigurationError,
-	checkCodexAuthDependency,
-	executeCodexTurn,
-	getCodexBridgeRuntimeSnapshot,
-} from '../bridge/codex/index.js'
-import {
-	captureAnthropicRequest,
+	RouterTraceContext,
 	buildRouterTraceContext,
+	captureAnthropicRequest,
 	captureRouterResponse,
 	captureRouterStreamEvent,
 	logRouterLine,
 } from '../observability/index.js'
-import { createAnthropicStream } from './streaming.js'
+import { loadConfig } from './config.js'
+import type { RouterConfig } from './config.js'
 import type {
 	AnthropicMessagesRequest,
+	CodexPromptMetrics,
 	RouterHealthResponse,
 } from '../shared/index.js'
-import type { RouterConfig } from './config.js'
-
-const contentBlockSchema: z.ZodType<unknown> = z.lazy(() =>
-	z.union([
-		z.object({
-			type: z.literal('text'),
-			text: z.string(),
-		}),
-		z.object({
-			type: z.literal('thinking'),
-			thinking: z.string(),
-			signature: z.string().optional(),
-		}),
-		z.object({
-			type: z.literal('tool_use'),
-			id: z.string(),
-			name: z.string(),
-			input: z.unknown(),
-		}),
-		z.object({
-			type: z.literal('tool_result'),
-			tool_use_id: z.string(),
-			content: z.union([z.string(), z.array(contentBlockSchema)]),
-		}),
-		z.object({
-			type: z.literal('image'),
-			source: z.object({
-				type: z.literal('base64'),
-				media_type: z.string(),
-				data: z.string(),
-			}),
-		}),
-	]),
-)
-
-const thinkingSchema = z
-	.union([
-		z
-			.object({
-				type: z.literal('enabled'),
-				budget_tokens: z.number().int().nonnegative().optional(),
-			})
-			.passthrough(),
-		z
-			.object({
-				type: z.string().optional(),
-				budget_tokens: z.number().int().nonnegative().optional(),
-			})
-			.passthrough(),
-	])
-	.optional()
 
 export const requestSchema = z.object({
-	model: z.string().min(1),
+	model: z.string().min(1, 'model is required'),
 	max_tokens: z.number().int().positive(),
-	messages: z.array(
-		z.object({
-			role: z.enum(['user', 'assistant', 'system']),
-			content: z.union([z.string(), z.array(contentBlockSchema)]),
-		}),
-	),
-	system: z.union([z.string(), z.array(contentBlockSchema)]).optional(),
+	messages: z
+		.array(
+			z.object({
+				role: z.enum(['user', 'assistant', 'system']),
+				content: z.union([
+					z.string(),
+					z.array(
+						z.union([
+							z.object({
+								type: z.literal('text'),
+								text: z.string(),
+							}),
+							z.object({
+								type: z.literal('thinking'),
+								thinking: z.string(),
+								signature: z.string().optional(),
+							}),
+							z.object({
+								type: z.literal('tool_use'),
+								id: z.string().min(1),
+								name: z.string().min(1),
+								input: z.record(z.string(), z.unknown()),
+							}),
+							z.object({
+								type: z.literal('tool_result'),
+								tool_use_id: z.string().min(1),
+								content: z.union([z.string(), z.array(z.unknown())]),
+							}),
+							z.object({
+								type: z.literal('image'),
+								source: z.object({
+									type: z.literal('base64'),
+									media_type: z.string(),
+									data: z.string(),
+								}),
+							}),
+						]),
+					),
+				]),
+			}),
+		)
+		.min(1, 'messages is required'),
+	system: z.union([z.string(), z.array(z.unknown())]).optional(),
 	stream: z.boolean().optional(),
 	tools: z
 		.array(
 			z.object({
-				name: z.string(),
+				name: z.string().min(1),
 				description: z.string().optional(),
 				input_schema: z.record(z.string(), z.unknown()),
 			}),
 		)
 		.optional(),
-	tool_choice: z.unknown().optional(),
-	thinking: thinkingSchema,
+	tool_choice: z
+		.union([
+			z.literal('auto'),
+			z.literal('any'),
+			z.literal('none'),
+			z.object({
+				type: z.union([z.literal('tool'), z.literal('none')]),
+				name: z.string().optional(),
+			}),
+		])
+		.optional(),
+	thinking: z
+		.union([
+			z.object({
+				type: z.literal('disabled'),
+			}),
+			z.object({
+				type: z.literal('enabled'),
+				budget_tokens: z.number().positive().int(),
+			}),
+			z.object({
+				budget_tokens: z.number().positive().int(),
+			}),
+		])
+		.optional(),
 	temperature: z.number().min(0).max(2).optional(),
 	top_p: z.number().min(0).max(1).optional(),
 	top_k: z.number().int().positive().optional(),
 })
 
-function mapErrorType(statusCode: number): string {
-	if (statusCode === 400) {
-		return 'invalid_request_error'
-	}
-
-	if (statusCode === 422) {
-		return 'invalid_request_error'
-	}
-
-	if (statusCode === 401 || statusCode === 403) {
-		return 'authentication_error'
-	}
-
-	if (statusCode === 429) {
-		return 'rate_limit_error'
-	}
-
-	return 'api_error'
+type AppFactoryResult = {
+	app: Hono
+	config: RouterConfig
+	hasCodexAuthFile: boolean
 }
 
-function buildErrorResponse(message: string, statusCode: number, routerRequestId?: string) {
+type UsageForCapture = Partial<{
+	input_tokens: number
+	output_tokens: number
+	cache_read_input_tokens: number
+	reasoning_output_tokens: number
+	total_tokens: number
+	inputTokens: number
+	outputTokens: number
+	cachedInputTokens: number
+	reasoningOutputTokens: number
+	totalTokens: number
+}>
+
+function toErrorResponse(status: number, message: string, rawMessage?: string) {
 	return Response.json(
 		{
+			type: 'error',
 			error: {
-				type: mapErrorType(statusCode),
+				type: 'invalid_request_error',
 				message,
+				raw_message: rawMessage ?? null,
 			},
 		},
-		{
-			status: statusCode,
-			headers: routerRequestId
-				? {
-						'X-Router-Request-Id': routerRequestId,
-					}
-				: undefined,
-		},
+		{ status },
 	)
 }
 
-export function createApp() {
-	const config = loadConfig()
-	const app = new Hono()
-	const AUTH_MODE_DEPENDENCY_TTL_MS = 30 * 1000
-	const AUTH_MODE_DEPENDENCY_TIMEOUT_MS = 1500
-	const authModeDependencyCache = {
-		value: true,
-		checkedAt: 0,
-		inflight: null as Promise<boolean> | null,
+function formatRouterModelList(models: { id: string; display_name: string }[]) {
+	return {
+		data: models.map((entry) => ({
+			type: 'model',
+			id: entry.id,
+			name: entry.display_name,
+		})),
+		object: 'list',
 	}
+}
 
-	function getAuthModeDependencyState(
-		config: RouterConfig,
-	): RouterHealthResponse['has_auth_mode_dependency'] | Promise<RouterHealthResponse['has_auth_mode_dependency']> {
-		switch (config.codexAuthMode) {
-			case 'api_key':
-				return Boolean(config.codexOpenAiApiKey)
-			case 'local_auth_json':
-				return existsSync(config.codexAuthFile)
-			case 'account':
-				if (
-					authModeDependencyCache.checkedAt > 0 &&
-					Date.now() - authModeDependencyCache.checkedAt <= AUTH_MODE_DEPENDENCY_TTL_MS &&
-					!authModeDependencyCache.inflight
-				) {
-					return authModeDependencyCache.value
-				}
-
-				if (!authModeDependencyCache.inflight) {
-					authModeDependencyCache.inflight = checkCodexAuthDependency(
-						config,
-						AUTH_MODE_DEPENDENCY_TIMEOUT_MS,
-					)
-						.then((result) => {
-							authModeDependencyCache.value = result
-							authModeDependencyCache.checkedAt = Date.now()
-							return result
-						})
-						.catch(() => {
-							authModeDependencyCache.value = false
-							authModeDependencyCache.checkedAt = Date.now()
-							return false
-						})
-						.finally(() => {
-							authModeDependencyCache.inflight = null
-						})
-				}
-
-				return authModeDependencyCache.inflight
-			default:
-				return true
-		}
+function toStreamHeaders(): HeadersInit {
+	return {
+		'Content-Type': 'text/event-stream',
+		'Cache-Control': 'no-cache',
+		Connection: 'keep-alive',
 	}
+}
 
-	if (config.logRequests) {
-		app.use('*', async (c, next) => {
-			const startedAt = Date.now()
-			logRouterLine(`request ${c.req.method} ${c.req.path}`)
-			await next()
-			logRouterLine(
-				`response ${c.req.method} ${c.req.path} status=${c.res.status} duration_ms=${Date.now() - startedAt}`,
-			)
-		})
+type HeadersInit = Headers | [string, string][] | Record<string, string>
+
+function pickUsageForCapture(usage: UsageForCapture) {
+	return {
+		usage_input_tokens: usage?.input_tokens ?? usage?.inputTokens ?? null,
+		usage_output_tokens: usage?.output_tokens ?? usage?.outputTokens ?? null,
+		usage_cached_input_tokens:
+			usage?.cache_read_input_tokens ?? usage?.cachedInputTokens ?? null,
+		usage_reasoning_output_tokens:
+			usage?.reasoning_output_tokens ?? usage?.reasoningOutputTokens ?? null,
+		usage_total_tokens: usage?.total_tokens ?? usage?.totalTokens ?? null,
 	}
+}
 
-	app.get('/', (c) => c.redirect('/health'))
-
-	app.get('/health', async (c) => {
-		const hasLocalAuthFile = existsSync(config.codexAuthFile)
-		const hasAuthModeDependency = await getAuthModeDependencyState(config)
-		const runtimeSnapshot = getCodexBridgeRuntimeSnapshot()
-		const body: RouterHealthResponse = {
+function buildHealthPayload(
+	config: RouterConfig,
+	healthReady: boolean,
+	hasAuthDependency: boolean,
+	authDependencyMessage: string | null,
+	codexSnapshot: ReturnType<typeof getCodexBridgeRuntimeSnapshot>,
+): RouterHealthResponse {
+	if (config.bridgeBackend === 'codex') {
+		return {
 			status: 'ok',
 			backend: 'codex_app_server',
 			auth_mode: config.codexAuthMode,
+			has_auth_mode_dependency: hasAuthDependency,
+			live: true,
+			readiness: healthReady ? 'ready' : 'degraded',
 			codex_command: config.codexCommand,
 			codex_runtime_cwd: config.codexRuntimeCwd,
 			codex_auth_file: config.codexAuthFile,
-			has_local_auth_file: hasLocalAuthFile,
-			has_auth_mode_dependency: hasAuthModeDependency,
-			live: true,
-			readiness: hasAuthModeDependency ? 'ready' : 'degraded',
-			queue_depth: runtimeSnapshot.queueDepth,
-			active_session_count: runtimeSnapshot.activeSessionCount,
-			pending_session_creates: runtimeSnapshot.pendingSessionCreates,
-			recent_retryable_failures: runtimeSnapshot.recentRetryableFailures,
-			recent_non_retryable_failures: runtimeSnapshot.recentNonRetryableFailures,
-			recent_retries: runtimeSnapshot.recentRetries,
+			has_local_auth_file: existsSync(config.codexAuthFile),
+			queue_depth: codexSnapshot.queueDepth,
+			active_session_count: codexSnapshot.activeSessionCount,
+			pending_session_creates: codexSnapshot.pendingSessionCreates,
+			recent_retryable_failures: codexSnapshot.recentRetryableFailures,
+			recent_non_retryable_failures: codexSnapshot.recentNonRetryableFailures,
+			recent_retries: codexSnapshot.recentRetries,
+			codex_model: config.modelAliases?.['claude-sonnet-4-5-20250929'],
+			has_ollama_api_key: Boolean(config.ollamaApiKey),
+			auth_message: authDependencyMessage,
+		}
+	}
+
+	return {
+		status: 'ok',
+		backend: 'ollama_api',
+		auth_mode: config.codexAuthMode,
+		has_auth_mode_dependency: hasAuthDependency,
+		live: true,
+		readiness: healthReady ? 'ready' : 'degraded',
+		ollama_base_url: config.ollamaBaseUrl,
+		ollama_model: config.ollamaModel,
+		has_ollama_api_key: Boolean(config.ollamaApiKey),
+		auth_message: authDependencyMessage,
+	}
+}
+
+function extractSessionId(context: { headers: RouterTraceContext['headers'] }) {
+	return context.headers.resolved_session_id
+}
+
+function extractConversationId(metadata: unknown) {
+	if (!metadata || typeof metadata !== 'object') {
+		return null
+	}
+
+	const typed = metadata as { threadId?: unknown }
+	return typeof typed.threadId === 'string' ? typed.threadId : null
+}
+
+export function createApp(): AppFactoryResult {
+	const config = loadConfig()
+	const hasCodexAuthFile = config.codexAuthMode === 'local_auth_json' ? existsSync(config.codexAuthFile) : false
+	const app = new Hono()
+	const provider = createBackendProvider(config)
+	const logRequests = config.logRequests
+
+	app.get('/health', async (c) => {
+		const startedAt = Date.now()
+		let hasAuthDependency = true
+		let healthReady = true
+		let authMessage: string | null = null
+		let codexSnapshot: ReturnType<typeof getCodexBridgeRuntimeSnapshot> = {
+			activeSessionCount: 0,
+			pendingSessionCreates: 0,
+			queueDepth: 0,
+			recentRetryableFailures: 0,
+			recentNonRetryableFailures: 0,
+			recentRetries: 0,
 		}
 
-		const isHealthy = Boolean(hasAuthModeDependency)
-		if (!isHealthy) {
-			if (config.codexAuthMode === 'local_auth_json' && !hasLocalAuthFile) {
-				logRouterLine(
-					`health auth dependency check failed: local_auth_json missing auth file path=${config.codexAuthFile}`,
-				)
-			} else if (config.codexAuthMode === 'account') {
-				logRouterLine('health auth dependency check failed: account auth probe returned false')
+		if (config.bridgeBackend === 'codex') {
+			try {
+				hasAuthDependency = await checkCodexAuthDependency(config)
+				codexSnapshot = getCodexBridgeRuntimeSnapshot()
+			} catch (error) {
+				healthReady = false
+				authMessage = error instanceof Error ? error.message : 'health check failed'
 			}
 		}
 
-		return c.json(body, isHealthy ? 200 : 503)
+		const status = healthReady ? 200 : 503
+		if (config.captureResponses) {
+			await captureRouterResponse(
+				config,
+				buildRouterTraceContext({
+					method: 'GET',
+					path: '/health',
+					headers: c.req.raw.headers,
+				}),
+				{
+					status,
+					duration_ms: Date.now() - startedAt,
+					error_type: healthReady ? undefined : 'auth_dependency_error',
+					error_message: healthReady ? undefined : authMessage ?? 'health dependency check failed',
+				},
+			)
+		}
+
+		if (logRequests) {
+			logRouterLine(
+				`GET /health status=${status} backend=${config.bridgeBackend} auth_dependency=${hasAuthDependency} readiness=${healthReady ? 'ready' : 'degraded'}`,
+			)
+		}
+
+		return c.json(buildHealthPayload(config, healthReady, hasAuthDependency, authMessage, codexSnapshot), status)
 	})
 
-	app.get('/v1/models', (c) => {
-		const modelIds = Object.keys(config.modelAliases)
-		return c.json({
-			data: modelIds.map((id) => ({
-				type: 'model',
-				id,
-				display_name: id,
-			})),
-			has_more: false,
-			first_id: modelIds[0] ?? null,
-			last_id: modelIds.at(-1) ?? null,
+	app.get('/v1/models', async (c) => {
+		const startedAt = Date.now()
+		const requestContext = buildRouterTraceContext({
+			method: 'GET',
+			path: '/v1/models',
+			headers: c.req.raw.headers,
 		})
+		try {
+			const models = await provider.listModels(config, c.req.raw.signal)
+			const responsePayload = formatRouterModelList(models)
+			if (config.captureResponses) {
+				await captureRouterResponse(config, requestContext, {
+					status: 200,
+					duration_ms: Date.now() - startedAt,
+				})
+			}
+			if (logRequests) {
+				logRouterLine(`GET /v1/models status=200 provider=${config.bridgeBackend}`)
+			}
+			return c.json(responsePayload)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'model list failed'
+			if (config.captureResponses) {
+				await captureRouterResponse(config, requestContext, {
+					status: 502,
+					duration_ms: Date.now() - startedAt,
+					error_type: 'models_error',
+					error_message: message,
+				})
+			}
+			if (logRequests) {
+				logRouterLine(`GET /v1/models status=502 error=${message}`)
+			}
+			return toErrorResponse(502, 'failed to load model list', message)
+		}
 	})
 
 	app.post('/v1/messages', async (c) => {
 		const startedAt = Date.now()
-		let traceContext = buildRouterTraceContext({
-			method: c.req.method,
-			path: c.req.path,
-			headers: c.req.raw.headers,
-		})
 		const rawBody = await c.req.text()
-		let requestBody: AnthropicMessagesRequest
-		logRouterLine(
-			`messages begin request_id=${traceContext.router_request_id} session_id=${traceContext.headers.resolved_session_id ?? 'none'} method=${traceContext.method} path=${traceContext.path}`,
-		)
+		let parsedBody: unknown
+		let parseError: string | null = null
 		try {
-			requestBody = requestSchema.parse(JSON.parse(rawBody)) as AnthropicMessagesRequest
-			validateAnthropicRequestSemantics(requestBody)
-			traceContext = buildRouterTraceContext({
-				method: c.req.method,
-				path: c.req.path,
-				headers: c.req.raw.headers,
-				request: requestBody,
-				routerRequestId: traceContext.router_request_id,
-			})
-			await captureAnthropicRequest(config, {
-				traceContext,
-				rawBody,
-				parsedRequest: requestBody,
-			})
+			parsedBody = JSON.parse(rawBody || '{}')
 		} catch (error) {
-			await captureAnthropicRequest(config, {
-				traceContext,
-				rawBody,
-				parseError: error instanceof Error ? error.message : 'request parse failed',
-			})
-			const status =
-				error instanceof AnthropicRequestValidationError
-					? error.statusCode
-					: 400
-			const message =
-				error instanceof z.ZodError
-					? error.issues.map((issue) => issue.message).join(', ')
-					: error instanceof AnthropicRequestValidationError
-						? error.message
-					: error instanceof Error
-						? error.message
-						: '잘못된 요청입니다.'
-			await captureRouterResponse(config, traceContext, {
-				status,
-				duration_ms: Date.now() - startedAt,
-				error_type: mapErrorType(status),
-				error_message: message,
-			})
-			logRouterLine(
-				`messages failed request_id=${traceContext.router_request_id} status=${status} duration_ms=${Date.now() - startedAt} error=${JSON.stringify(message)}`,
-			)
-			return buildErrorResponse(message, status, traceContext.router_request_id)
+			parseError = error instanceof Error ? error.message : 'body parse failed'
+			parsedBody = {}
 		}
 
-		try {
-			if (requestBody.stream) {
-				await captureRouterStreamEvent(config, traceContext, {
-					stream_phase: 'opened',
-					status: 200,
+		const validated = requestSchema.safeParse(parsedBody)
+		if (!validated.success || parseError) {
+			const traceContext = buildRouterTraceContext({
+				method: 'POST',
+				path: '/v1/messages',
+				headers: c.req.raw.headers,
+			})
+			await captureAnthropicRequest(config, {
+				traceContext,
+				rawBody,
+				parseError: parseError ?? 'schema validation failed',
+			})
+			if (config.captureResponses) {
+				await captureRouterResponse(config, traceContext, {
+					status: 400,
 					duration_ms: Date.now() - startedAt,
-				})
-				const codexContext = {
-					sessionId: traceContext.headers.resolved_session_id,
-					routerRequestId: traceContext.router_request_id,
-					userAgent: traceContext.headers.user_agent,
-					abortSignal: c.req.raw.signal,
-				}
-				const stream = createAnthropicStream(config, requestBody, codexContext, {
-					onSessionReady: async (metadata) => {
-						logRouterLine(
-							`stream session_ready request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} model=${metadata.model} workspace_root=${JSON.stringify(metadata.workspaceRoot)} thread_mode=${metadata.threadMode} thread_reuse_reason=${metadata.threadReuseReason} thread_cache_key=${metadata.threadCacheKey ?? 'none'}`,
-						)
-					},
-					onComplete: async ({ stopReason, usage, promptMetrics, decision, metadata }) => {
-						await captureRouterStreamEvent(config, traceContext, {
-							stream_phase: 'completed',
-							status: 200,
-							duration_ms: Date.now() - startedAt,
-							stream_end_reason: stopReason,
-							codex_model: metadata.model,
-							conversation_id: metadata.threadId,
-							workspace_root: metadata.workspaceRoot,
-							thread_mode: metadata.threadMode,
-							thread_reuse_reason: metadata.threadReuseReason,
-							thread_cache_key: metadata.threadCacheKey,
-							usage_output_tokens: usage.outputTokens,
-							usage_input_tokens: usage.inputTokens,
-							usage_cached_input_tokens: usage.cachedInputTokens,
-							usage_reasoning_output_tokens: usage.reasoningOutputTokens,
-							usage_total_tokens: usage.totalTokens,
-							prompt_metrics: promptMetrics,
-							decision_kind: decision?.kind ?? null,
-							tool_use_name:
-								decision?.kind === 'tool_use' ? decision.name : null,
-						})
-						logRouterLine(
-							`stream completed request_id=${traceContext.router_request_id} conversation_id=${metadata.threadId} end_reason=${stopReason} tool=${decision?.kind === 'tool_use' ? decision.name : 'none'} output_tokens=${usage.outputTokens} thread_mode=${metadata.threadMode} thread_reuse_reason=${metadata.threadReuseReason}`,
-						)
-					},
-					onError: async ({ error, metadata }) => {
-						const message = error instanceof Error ? error.message : String(error)
-						const status = error instanceof AuthConfigurationError ? 401 : 200
-						await captureRouterStreamEvent(config, traceContext, {
-							stream_phase: 'failed',
-							status,
-							duration_ms: Date.now() - startedAt,
-							stream_end_reason: 'error',
-							error_message: message,
-							codex_model: metadata?.model ?? null,
-							conversation_id: metadata?.threadId ?? null,
-							workspace_root: metadata?.workspaceRoot ?? null,
-							thread_mode: metadata?.threadMode ?? null,
-							thread_reuse_reason: metadata?.threadReuseReason ?? null,
-							thread_cache_key: metadata?.threadCacheKey ?? null,
-						})
-						logRouterLine(
-							`stream failed request_id=${traceContext.router_request_id} status=${status} conversation_id=${metadata?.threadId ?? 'none'} error=${JSON.stringify(message)} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
-						)
-					},
-					onCancel: async ({ metadata }) => {
-						await captureRouterStreamEvent(config, traceContext, {
-							stream_phase: 'cancelled',
-							status: 499,
-							duration_ms: Date.now() - startedAt,
-							stream_end_reason: 'cancelled',
-							codex_model: metadata?.model ?? null,
-							conversation_id: metadata?.threadId ?? null,
-							workspace_root: metadata?.workspaceRoot ?? null,
-							thread_mode: metadata?.threadMode ?? null,
-							thread_reuse_reason: metadata?.threadReuseReason ?? null,
-							thread_cache_key: metadata?.threadCacheKey ?? null,
-						})
-						logRouterLine(
-							`stream cancelled request_id=${traceContext.router_request_id} conversation_id=${metadata?.threadId ?? 'none'} thread_mode=${metadata?.threadMode ?? 'none'} thread_reuse_reason=${metadata?.threadReuseReason ?? 'none'}`,
-						)
-					},
-				})
-				return new Response(stream, {
-					status: 200,
-					headers: {
-						'Content-Type': 'text/event-stream; charset=utf-8',
-						'Cache-Control': 'no-cache, no-transform',
-						Connection: 'keep-alive',
-						'X-Router-Request-Id': traceContext.router_request_id,
-					},
+					error_type: parseError ? 'json_parse_error' : 'validation_error',
+					error_message: parseError ? parseError : validated.success ? undefined : JSON.stringify(validated.error.format()),
 				})
 			}
+			if (logRequests) {
+				logRouterLine(`POST /v1/messages status=400 parse_error`)
+			}
+			return toErrorResponse(400, parseError ? 'invalid JSON body' : 'invalid request format')
+		}
 
-			const result = await executeCodexTurn(config, requestBody, {
-				sessionId: traceContext.headers.resolved_session_id,
-				routerRequestId: traceContext.router_request_id,
-				userAgent: traceContext.headers.user_agent,
-				abortSignal: c.req.raw.signal,
-			})
-			const anthropicResponse = mapCodexResultToAnthropic(result, requestBody.model)
-			c.header('X-Router-Request-Id', traceContext.router_request_id)
-			await captureRouterResponse(config, traceContext, {
-				status: 200,
-				duration_ms: Date.now() - startedAt,
-				stop_reason: anthropicResponse.stop_reason,
-				codex_model: result.model,
-				conversation_id: result.metadata?.threadId ?? null,
-				workspace_root: result.metadata?.workspaceRoot ?? null,
-				thread_mode: result.metadata?.threadMode ?? null,
-				thread_reuse_reason: result.metadata?.threadReuseReason ?? null,
-				thread_cache_key: result.metadata?.threadCacheKey ?? null,
-				usage_output_tokens: result.usage.outputTokens,
-				usage_input_tokens: result.usage.inputTokens,
-				usage_cached_input_tokens: result.usage.cachedInputTokens,
-				usage_reasoning_output_tokens: result.usage.reasoningOutputTokens,
-				usage_total_tokens: result.usage.totalTokens,
-				prompt_metrics: result.promptMetrics,
-				decision_kind: result.decision?.kind ?? null,
-				tool_use_name:
-					result.decision?.kind === 'tool_use' ? result.decision.name : null,
-			})
-			logRouterLine(
-				`messages completed request_id=${traceContext.router_request_id} status=200 stop_reason=${anthropicResponse.stop_reason ?? 'null'} duration_ms=${Date.now() - startedAt} conversation_id=${result.metadata?.threadId ?? 'none'} thread_mode=${result.metadata?.threadMode ?? 'none'} thread_reuse_reason=${result.metadata?.threadReuseReason ?? 'none'}`,
-			)
-			return c.json(anthropicResponse)
+		const request = validated.data as unknown as AnthropicMessagesRequest
+		const traceContext = buildRouterTraceContext({
+			method: 'POST',
+			path: '/v1/messages',
+			headers: c.req.raw.headers,
+			request,
+		})
+
+		await captureAnthropicRequest(config, {
+			traceContext,
+			rawBody,
+			parsedRequest: request,
+		})
+
+		try {
+			validateAnthropicRequestSemantics(request)
 		} catch (error) {
-			if (error instanceof AuthConfigurationError) {
-				const status = 401
+			const status = error instanceof AnthropicRequestValidationError ? error.statusCode : 422
+			const message = error instanceof Error ? error.message : 'invalid request body'
+			if (config.captureResponses) {
 				await captureRouterResponse(config, traceContext, {
 					status,
 					duration_ms: Date.now() - startedAt,
-					error_type: mapErrorType(status),
-					error_message: error.message,
+					error_type: 'validation_error',
+					error_message: message,
 				})
-				logRouterLine(
-					`messages failed request_id=${traceContext.router_request_id} status=${status} duration_ms=${Date.now() - startedAt} error=${JSON.stringify(error.message)}`,
-				)
-				return buildErrorResponse(error.message, status, traceContext.router_request_id)
 			}
-
-			const message = error instanceof Error ? error.message : '내부 서버 오류'
-			await captureRouterResponse(config, traceContext, {
-				status: 500,
-				duration_ms: Date.now() - startedAt,
-				error_type: mapErrorType(500),
-				error_message: message,
-			})
-			logRouterLine(
-				`messages failed request_id=${traceContext.router_request_id} status=500 duration_ms=${Date.now() - startedAt} error=${JSON.stringify(message)}`,
-			)
-			return buildErrorResponse(message, 500, traceContext.router_request_id)
+			if (logRequests) {
+				logRouterLine(`POST /v1/messages status=${status} validation_error`)
+			}
+			return toErrorResponse(status, message)
 		}
+
+		const requestContext = {
+			sessionId: extractSessionId({ headers: traceContext.headers }) || null,
+			routerRequestId: traceContext.router_request_id,
+			userAgent: traceContext.headers.user_agent,
+			abortSignal: c.req.raw.signal,
+		}
+		const stream = request.stream === true
+
+		if (!stream) {
+			try {
+				const result = await provider.executeNonStream(config, request, requestContext)
+				await captureRouterResponse(config, traceContext, {
+					status: 200,
+					duration_ms: Date.now() - startedAt,
+					stop_reason: result.response.stop_reason,
+					...pickUsageForCapture(result.response.usage),
+					prompt_metrics: result.promptMetrics,
+					codex_model: result.response.model,
+				})
+				if (logRequests) {
+					logRouterLine(`POST /v1/messages status=200 non-stream model=${result.response.model}`)
+				}
+				return c.json(result.response, 200)
+			} catch (error) {
+				const message = error instanceof Error ? error.message : 'failed to execute message'
+				await captureRouterResponse(config, traceContext, {
+					status: 502,
+					duration_ms: Date.now() - startedAt,
+					error_type: 'provider_error',
+					error_message: message,
+				})
+				return toErrorResponse(502, 'failed to execute message', message)
+			}
+		}
+
+		let onCompleteTriggered = false
+		const streamResponse = provider.createStream(
+			config,
+			request,
+			requestContext,
+			{
+				onSessionReady: () => {
+					void captureRouterStreamEvent(
+						config,
+						traceContext,
+						{
+							stream_phase: 'opened',
+							duration_ms: Date.now() - startedAt,
+							status: 200,
+						},
+					)
+					if (logRequests) {
+						logRouterLine(`POST /v1/messages stream started provider=${config.bridgeBackend}`)
+					}
+				},
+				onComplete: (payload) => {
+					if (onCompleteTriggered) {
+						return
+					}
+					onCompleteTriggered = true
+					const toolUseName =
+						'decision' in payload && payload.decision?.kind === 'tool_use'
+							? payload.decision.name
+							: null
+					void captureRouterStreamEvent(
+						config,
+						traceContext,
+						{
+							stream_phase: 'completed',
+							duration_ms: Date.now() - startedAt,
+							status: 200,
+							stream_end_reason: payload.stopReason,
+							codex_model: payload.metadata?.model ?? null,
+							...pickUsageForCapture(payload.usage),
+							prompt_metrics: (payload as { promptMetrics?: CodexPromptMetrics }).promptMetrics,
+							tool_use_name: toolUseName,
+							conversation_id: extractConversationId(payload.metadata),
+						},
+					)
+				},
+				onError: (payload) => {
+					if (onCompleteTriggered) {
+						return
+					}
+					onCompleteTriggered = true
+					void captureRouterStreamEvent(
+						config,
+						traceContext,
+						{
+							stream_phase: 'failed',
+							duration_ms: Date.now() - startedAt,
+							status: 502,
+							stream_end_reason: null,
+							error_message:
+								payload.error instanceof Error ? payload.error.message : String(payload.error),
+							codex_model: payload.metadata?.model ?? null,
+						},
+					)
+				},
+				onCancel: () => {
+					void captureRouterStreamEvent(
+						config,
+						traceContext,
+						{
+							stream_phase: 'cancelled',
+							duration_ms: Date.now() - startedAt,
+							status: 499,
+							stream_end_reason: 'client_cancelled',
+						},
+					)
+				},
+			},
+		)
+
+		return new Response(streamResponse, {
+			status: 200,
+			headers: toStreamHeaders(),
+		})
 	})
 
-	return {
-		app,
-		config,
-		hasCodexAuthFile: existsSync(config.codexAuthFile),
-	}
+	return { app, config, hasCodexAuthFile }
 }

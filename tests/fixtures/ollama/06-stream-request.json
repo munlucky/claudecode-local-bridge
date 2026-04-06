@@ -1,0 +1,10 @@
+{
+  "model": "qwen3.5:27b",
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": "짧게 자기소개를 해줘"
+    }
+  ]
+}

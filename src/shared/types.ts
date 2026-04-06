@@ -111,6 +111,11 @@ export interface AnthropicMessagesResponse {
 	usage: AnthropicUsage
 }
 
+export interface AnthropicToolChoiceRaw {
+	type: 'tool'
+	name: string
+}
+
 export interface CodexBridgeAssistantDecision {
 	kind: 'assistant'
 	text: string
@@ -182,14 +187,40 @@ export interface CodexTurnResult {
 	metadata?: CodexTurnMetadata & { model: string }
 }
 
+export interface OllamaTurnMetadata {
+	model: string
+	provider: 'ollama'
+	requestedModel: string
+	stream: boolean
+}
+
+export interface OllamaToolCall {
+	id: string
+	type: 'function'
+	function: {
+		name: string
+		arguments: JsonObject
+	}
+}
+
+export interface OllamaTurnResult {
+	id: string
+	model: string
+	text: string
+	usage: CodexTokenUsage
+	stopReason: 'stop' | 'tool_calls'
+	toolCalls?: OllamaToolCall[]
+	thinking?: string | null
+	metadata?: OllamaTurnMetadata
+	promptMetrics?: CodexPromptMetrics
+}
+
+export type BridgeBackend = 'codex' | 'ollama'
+
 export interface RouterHealthResponse {
 	status: 'ok'
-	backend: 'codex_app_server'
+	backend: 'codex_app_server' | 'ollama_api'
 	auth_mode: 'api_key' | 'account' | 'local_auth_json' | 'disabled'
-	codex_command: string
-	codex_runtime_cwd: string
-	codex_auth_file: string
-	has_local_auth_file: boolean
 	has_auth_mode_dependency: boolean
 	live?: boolean
 	readiness?: 'ready' | 'degraded'
@@ -199,4 +230,16 @@ export interface RouterHealthResponse {
 	recent_retryable_failures?: number
 	recent_non_retryable_failures?: number
 	recent_retries?: number
+
+	codex_command?: string
+	codex_runtime_cwd?: string
+	codex_auth_file?: string
+	has_local_auth_file?: boolean
+	codex_model?: string | null
+
+	ollama_base_url?: string
+	ollama_model?: string
+	has_ollama_api_key?: boolean
+
+	auth_message?: string | null
 }

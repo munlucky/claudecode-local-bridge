@@ -2,6 +2,33 @@ import { describe, expect, test } from 'bun:test'
 import { loadConfig } from '../../src/server/index.js'
 
 describe('loadConfig', () => {
+	const restore = (key: string, value: string | undefined) => {
+		if (value === undefined) {
+			delete process.env[key]
+			return
+		}
+		process.env[key] = value
+	}
+
+	const withEnv = (values: Record<string, string | undefined>) => {
+		const original = Object.fromEntries(
+			Object.keys(values).map((key) => [key, process.env[key]]),
+		) as Record<string, string | undefined>
+		for (const [key, value] of Object.entries(values)) {
+			if (value === undefined) {
+				delete process.env[key]
+			} else {
+				process.env[key] = value
+			}
+		}
+
+		return () => {
+			for (const [key, value] of Object.entries(original)) {
+				restore(key, value)
+			}
+		}
+	}
+
 	test('defaults auth mode to local auth json for this bridge', () => {
 		delete process.env.CODEX_AUTH_MODE
 		delete process.env.API_TIMEOUT_MS
@@ -54,5 +81,36 @@ describe('loadConfig', () => {
 
 		expect(config.captureMaxFileBytes).toBe(5 * 1024 * 1024)
 		expect(config.captureRetentionDays).toBe(7)
+	})
+
+	test('parses bridge backend override', () => {
+		const restore = withEnv({ BRIDGE_BACKEND: 'ollama' })
+		const ollamaConfig = loadConfig()
+		expect(ollamaConfig.bridgeBackend).toBe('ollama')
+
+		restore()
+		const restoreCodex = withEnv({ BRIDGE_BACKEND: 'codex' })
+		const codexConfig = loadConfig()
+		expect(codexConfig.bridgeBackend).toBe('codex')
+		restoreCodex()
+	})
+
+	test('parses Ollama env and defaults', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+			OLLAMA_REQUEST_TIMEOUT_MS: '45000',
+			OLLAMA_SHOW_THINKING: '1',
+		})
+
+		const config = loadConfig()
+
+		expect(config.bridgeBackend).toBe('ollama')
+		expect(config.ollamaBaseUrl).toBe('http://127.0.0.1:11434')
+		expect(config.ollamaModel).toBe('qwen3.5:27b')
+		expect(config.ollamaRequestTimeoutMs).toBe(45000)
+		expect(config.ollamaShowThinking).toBe(true)
+		restore()
 	})
 })

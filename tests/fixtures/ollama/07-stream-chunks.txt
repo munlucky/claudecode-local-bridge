@@ -1,0 +1,5 @@
+{"model":"qwen3.5:27b","created_at":"2026-04-06T01:52:01.641438712Z","message":{"role":"assistant","content":"","thinking":"Thinking"},"done":false}
+{"model":"qwen3.5:27b","created_at":"2026-04-06T01:52:01.678677349Z","message":{"role":"assistant","content":"","thinking":" Process"},"done":false}
+{"model":"qwen3.5:27b","created_at":"2026-04-06T01:52:01.706775604Z","message":{"role":"assistant","content":"","thinking":":"},"done":false}
+{"model":"qwen3.5:27b","created_at":"2026-04-06T01:52:01.762685926Z","message":{"role":"assistant","content":"","thinking":"\n\n1"},"done":false}
+{"model":"qwen3.5:27b","created_at":"2026-04-06T01:52:01.791046336Z","message":{"role":"assistant","content":"","thinking":"."},"done":false}
