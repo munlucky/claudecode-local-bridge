@@ -58,6 +58,7 @@ describe('Ollama router integration', () => {
 			BRIDGE_BACKEND: 'ollama',
 			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
 			OLLAMA_MODEL: 'qwen3.5:27b',
+			OLLAMA_SHOW_THINKING: 'false',
 		})
 		try {
 			const { app } = createApp()
@@ -119,6 +120,7 @@ describe('Ollama router integration', () => {
 			BRIDGE_BACKEND: 'ollama',
 			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
 			OLLAMA_MODEL: 'qwen3.5:27b',
+			OLLAMA_SHOW_THINKING: 'false',
 		})
 
 		try {
@@ -191,6 +193,7 @@ describe('Ollama router integration', () => {
 			BRIDGE_BACKEND: 'ollama',
 			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
 			OLLAMA_MODEL: 'qwen3.5:27b',
+			OLLAMA_SHOW_THINKING: 'false',
 		})
 
 		try {
@@ -239,6 +242,65 @@ describe('Ollama router integration', () => {
 			expect(payload).toContain('event: message_stop')
 			expect(payload).not.toContain('internal')
 			expect(payload).not.toContain('next')
+		} finally {
+			restore()
+		}
+	})
+
+	test('streams SSE-wrapped OpenAI events via ollama route', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+			OLLAMA_SHOW_THINKING: 'false',
+		})
+
+		try {
+			restoreFetch(async (input) => {
+				if (String(input).includes('/api/chat')) {
+					const chunkLines = [
+						'event: message',
+						'data: {"id":"chatcmpl-04","object":"chat.completion.chunk","created":1770000004,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":"하나"},"finish_reason":null}]}',
+						'',
+						'data: {"id":"chatcmpl-04","object":"chat.completion.chunk","created":1770000004,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":" 둘"},"finish_reason":"stop"}]}',
+						'',
+						'data: [DONE]',
+					]
+					return new Response(createMockReadableStream(chunkLines), {
+						headers: {
+							'content-type': 'text/event-stream',
+						},
+					})
+				}
+				throw new Error('unexpected endpoint')
+			})
+
+			const { app, config } = createApp()
+			const requestBody = {
+				model: 'qwen3.5:27b',
+				max_tokens: 128,
+				stream: true,
+				messages: [{ role: 'user', content: '두 단어만' }],
+			}
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify(requestBody),
+				}),
+			)
+			const payload = await response.text()
+
+			expect(config.bridgeBackend).toBe('ollama')
+			expect(response.status).toBe(200)
+			expect(response.headers.get('content-type')).toContain('text/event-stream')
+			expect(payload).toContain('event: content_block_start')
+			expect(payload).toContain('하나')
+			expect(payload).toContain(' 둘')
+			expect(payload).toContain('event: message_delta')
+			expect(payload).toContain('event: message_stop')
 		} finally {
 			restore()
 		}

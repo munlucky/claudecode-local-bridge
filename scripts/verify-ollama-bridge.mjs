@@ -15,7 +15,7 @@ if (argv.help) {
 
 const config = {
   baseUrl: argv.base || process.env.BRIDGE_BASE_URL || 'http://127.0.0.1:3000',
-  model: argv.model || process.env.OLLAMA_MODEL || 'qwen3.5:27b',
+  model: argv.model || process.env.OLLAMA_MODEL || null,
   timeoutMs: Number(process.env.BRIDGE_REQUEST_TIMEOUT_MS || argv.timeout || 120000),
   outputDir:
     argv.out || process.env.BRIDGE_OUTPUT_DIR || path.join(process.cwd(), '.bridge-qa'),
@@ -80,6 +80,7 @@ const scenarios = [
               b: { type: 'number' },
             },
             required: ['a', 'b'],
+            additionalProperties: false,
           },
         },
       ],
@@ -109,6 +110,7 @@ const scenarios = [
       shouldStream: true,
       hasAtLeastOneChunk: true,
       mustFinish: true,
+      mustIncludeText: true,
     },
   },
 ];
@@ -139,8 +141,13 @@ async function main() {
     parser: readNonStreamJson,
   });
   summary.scenarios.push(health.result);
+  if (!config.model) {
+    config.model = health.responseRecord?.data?.ollama_model || 'qwen3.5:27b';
+    summary.model = config.model;
+  }
 
   for (const scenario of scenarios) {
+    scenario.body.model = config.model;
     const endpoint = '/v1/messages';
     const requestFile = path.join(reportDir, `${scenario.id}-request.json`);
     const result = await runRequest({
@@ -206,6 +213,7 @@ async function runRequest({
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
   let response;
   let bodyData;
+  let responseRecord = null;
   let ok = true;
   const checks = [];
   const issues = [];
@@ -220,7 +228,7 @@ async function runRequest({
     const elapsedMs = Date.now() - Date.parse(started);
     const parseResult = await parser(response);
     bodyData = parseResult.data;
-    const responseRecord = {
+    responseRecord = {
       status: response.status,
       statusText: response.statusText,
       elapsedMs,
@@ -241,7 +249,7 @@ async function runRequest({
       ok = false;
       issues.push(`예상 응답 200, 실제 ${response.status}`);
     } else {
-      evaluateScenario({
+      ok = evaluateScenario({
         id,
         expected,
         body: parseResult,
@@ -252,7 +260,21 @@ async function runRequest({
     }
   } catch (error) {
     ok = false;
-    issues.push(`요청 실패: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    issues.push(`요청 실패: ${message}`);
+    responseRecord = {
+      status: null,
+      statusText: null,
+      elapsedMs: Date.now() - Date.parse(started),
+      headers: {},
+      data: {
+        type: 'error',
+        error: {
+          message,
+        },
+      },
+    };
+    await writeJson(path.join(reportDir, `${id}-response.json`), responseRecord, true);
   } finally {
     clearTimeout(timer);
   }
@@ -298,6 +320,7 @@ async function runRequest({
       startedAt: started,
       finishedAt: new Date().toISOString(),
     },
+    responseRecord,
   };
 }
 
@@ -326,7 +349,7 @@ function evaluateScenario({ id, expected, body, response, checks, issues }) {
   }
 
   if (id === '03-stream') {
-    const streamBody = body;
+    const streamBody = body.data;
     if (expected?.hasAtLeastOneChunk && streamBody.chunkCount < 1) {
       issues.push('스트리밍 청크가 수신되지 않았습니다');
       return false;
@@ -335,10 +358,17 @@ function evaluateScenario({ id, expected, body, response, checks, issues }) {
       issues.push('DONE 신호를 받지 못했습니다');
       return false;
     }
+    if (expected?.mustIncludeText && !streamBody.hasTextContent) {
+      issues.push('스트리밍 텍스트 콘텐츠가 없습니다');
+      return false;
+    }
     checks.push('stream-chunks');
+    if (expected?.mustIncludeText) {
+      checks.push('stream-text-check');
+    }
   }
 
-  if (expected?.minContentBlocks || expected?.mustIncludeText) {
+  if (!expected?.shouldStream && (expected?.minContentBlocks || expected?.mustIncludeText)) {
     const content = body.data?.content;
     if (!Array.isArray(content) || content.length < (expected.minContentBlocks || 1)) {
       issues.push('content 블록이 부족합니다');
@@ -381,6 +411,9 @@ async function readSseStream(response) {
         doneReceived: false,
         parsedLines: [],
         rawLines: [],
+        contentText: '',
+        hasTextContent: false,
+        hasMeaningfulContent: false,
       },
     };
   }
@@ -398,21 +431,21 @@ async function readSseStream(response) {
     if (chunk.done) break;
     body += decoder.decode(chunk.value, { stream: true });
     let idx;
-      while ((idx = body.indexOf('\n')) !== -1) {
-        const line = body.slice(0, idx).trimEnd();
-        body = body.slice(idx + 1);
-        if (line.length === 0) continue;
-        processSseLine({
-          line,
-          rawLines,
-          parsedLines,
-          onChunk: () => {
-            chunkCount += 1;
-          },
-          onDone: () => {
-            doneReceived = true;
-          },
-        });
+    while ((idx = body.indexOf('\n')) !== -1) {
+      const line = body.slice(0, idx).trimEnd();
+      body = body.slice(idx + 1);
+      if (line.length === 0) continue;
+      processSseLine({
+        line,
+        rawLines,
+        parsedLines,
+        onChunk: () => {
+          chunkCount += 1;
+        },
+        onDone: () => {
+          doneReceived = true;
+        },
+      });
     }
   }
 
@@ -430,6 +463,8 @@ async function readSseStream(response) {
     });
   }
 
+  const streamSummary = summarizeSseContent(parsedLines);
+
   return {
     data: {
       kind: 'sse',
@@ -437,6 +472,9 @@ async function readSseStream(response) {
       doneReceived,
       parsedLines,
       rawLines,
+      contentText: streamSummary.contentText,
+      hasTextContent: streamSummary.hasTextContent,
+      hasMeaningfulContent: streamSummary.hasMeaningfulContent,
       content:
         parsedLines.length && typeof parsedLines[parsedLines.length - 1]?.message === 'object'
           ? parsedLines.at(-1).message?.content
@@ -460,9 +498,50 @@ function processSseLine({ line, rawLines, parsedLines, onChunk, onDone }) {
     const parsed = JSON.parse(payload);
     parsedLines.push(parsed);
     onChunk();
+    if (parsed?.type === 'message_stop') {
+      onDone();
+    }
   } catch {
     parsedLines.push({ parseError: true, raw: payload });
   }
+}
+
+function summarizeSseContent(parsedLines) {
+  let contentText = '';
+  let hasToolUse = false;
+
+  for (const parsed of parsedLines) {
+    if (!parsed || typeof parsed !== 'object') continue;
+
+    if (parsed.type === 'content_block_start') {
+      if (parsed.content_block?.type === 'tool_use') {
+        hasToolUse = true;
+      }
+      if (
+        parsed.content_block?.type === 'text' &&
+        typeof parsed.content_block.text === 'string' &&
+        parsed.content_block.text.length > 0
+      ) {
+        contentText += parsed.content_block.text;
+      }
+    }
+
+    if (
+      parsed.type === 'content_block_delta' &&
+      parsed.delta?.type === 'text_delta' &&
+      typeof parsed.delta.text === 'string'
+    ) {
+      contentText += parsed.delta.text;
+    }
+  }
+
+  const hasTextContent = contentText.trim().length > 0;
+
+  return {
+    contentText,
+    hasTextContent,
+    hasMeaningfulContent: hasTextContent || hasToolUse,
+  };
 }
 
 function hasToolCallInObject(value) {

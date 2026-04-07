@@ -1,0 +1,31 @@
+{
+  "id": "chatcmpl-02",
+  "object": "chat.completion",
+  "created": 1770000001,
+  "model": "qwen3.5:27b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_openai_add_numbers",
+            "type": "function",
+            "function": {
+              "name": "add_numbers",
+              "arguments": "{\"a\":19,\"b\":23}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 320,
+    "completion_tokens": 32,
+    "total_tokens": 352
+  }
+}

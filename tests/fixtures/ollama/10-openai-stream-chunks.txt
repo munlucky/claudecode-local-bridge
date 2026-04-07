@@ -1,0 +1,2 @@
+{"id":"chatcmpl-03","object":"chat.completion.chunk","created":1770000002,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":"안"},"finish_reason":null}]}
+{"id":"chatcmpl-03","object":"chat.completion.chunk","created":1770000002,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":"녕하세요"},"finish_reason":"stop"}]}

@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-03",
+  "object": "chat.completion",
+  "created": 1770000003,
+  "model": "qwen3.5:27b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "테스트용 토큰 계산 응답입니다."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 34,
+    "total_tokens": 46
+  }
+}

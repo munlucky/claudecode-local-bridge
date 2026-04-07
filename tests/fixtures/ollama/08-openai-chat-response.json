@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-01",
+  "object": "chat.completion",
+  "created": 1770000000,
+  "model": "qwen3.5:27b",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "안녕하세요, 제 소개를 한 줄로 하자면 AI 비서입니다."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 17,
+    "completion_tokens": 19,
+    "total_tokens": 36
+  }
+}

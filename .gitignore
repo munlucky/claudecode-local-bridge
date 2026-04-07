@@ -134,3 +134,4 @@ bun.lock
 docs
 workflow
 claude-code-main
+.bridge-qa
