@@ -15,7 +15,9 @@ import {
 import { loadConfig } from './config.js'
 import type { RouterConfig } from './config.js'
 import type {
+	AnthropicMessagesResponse,
 	AnthropicMessagesRequest,
+	AnthropicToolUseBlock,
 	CodexPromptMetrics,
 	RouterHealthResponse,
 } from '../shared/index.js'
@@ -99,6 +101,12 @@ export const requestSchema = z.object({
 			z.object({
 				budget_tokens: z.number().positive().int(),
 			}),
+			z
+				.object({
+					type: z.string().optional(),
+					budget_tokens: z.number().positive().int().optional(),
+				})
+				.passthrough(),
 		])
 		.optional(),
 	temperature: z.number().min(0).max(2).optional(),
@@ -160,6 +168,12 @@ function toStreamHeaders(): HeadersInit {
 
 type HeadersInit = Headers | [string, string][] | Record<string, string>
 
+type DirectSkillInvocation = {
+	skill: string
+	args?: string
+	rawCommand: string
+}
+
 function pickUsageForCapture(usage: UsageForCapture) {
 	return {
 		usage_input_tokens: usage?.input_tokens ?? usage?.inputTokens ?? null,
@@ -170,6 +184,287 @@ function pickUsageForCapture(usage: UsageForCapture) {
 			usage?.reasoning_output_tokens ?? usage?.reasoningOutputTokens ?? null,
 		usage_total_tokens: usage?.total_tokens ?? usage?.totalTokens ?? null,
 	}
+}
+
+function summarizeToolInputForCapture(input: unknown) {
+	const normalized =
+		input && typeof input === 'object' && !Array.isArray(input)
+			? (input as Record<string, unknown>)
+			: {}
+
+	let preview: string
+	try {
+		preview = JSON.stringify(normalized)
+	} catch {
+		preview = String(normalized)
+	}
+
+	return {
+		tool_use_input_preview: preview.length > 240 ? `${preview.slice(0, 237)}...` : preview,
+		tool_use_file_path:
+			typeof normalized.file_path === 'string' ? normalized.file_path : null,
+		tool_use_path: typeof normalized.path === 'string' ? normalized.path : null,
+		tool_use_pattern:
+			typeof normalized.pattern === 'string' ? normalized.pattern : null,
+	}
+}
+
+function extractTextFromContent(content: AnthropicMessagesRequest['messages'][number]['content']) {
+	if (typeof content === 'string') {
+		return content
+	}
+
+	if (!Array.isArray(content)) {
+		return ''
+	}
+
+	return content
+		.map((block) => {
+			if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+				return block.text
+			}
+			return ''
+		})
+		.filter(Boolean)
+		.join('\n')
+}
+
+function parseSlashCommand(text: string): DirectSkillInvocation | null {
+	const commandLineMatches = Array.from(
+		text.matchAll(/(?:^|\n)\s*\/([A-Za-z0-9][A-Za-z0-9:_-]*)(?:\s+([^\n]+))?(?=$|\n)/g),
+	)
+	const commandLineMatch = commandLineMatches.at(-1)
+	if (commandLineMatch) {
+		const [, skill, args] = commandLineMatch
+		if (skill) {
+			const rawCommand = commandLineMatch[0].trim()
+			return {
+				skill,
+				args: typeof args === 'string' && args.trim() ? args.trim() : undefined,
+				rawCommand,
+			}
+		}
+	}
+
+	const tagMatches = Array.from(
+		text.matchAll(/<command-name>\s*([A-Za-z0-9][A-Za-z0-9:_-]*)\s*<\/command-name>/g),
+	)
+	const tagMatch = tagMatches.at(-1)
+	if (!tagMatch?.[1]) {
+		return null
+	}
+
+	return {
+		skill: tagMatch[1],
+		rawCommand: `<command-name>${tagMatch[1]}</command-name>`,
+	}
+}
+
+function contentContainsLoadedSkillBody(
+	content: AnthropicMessagesRequest['messages'][number]['content'],
+): boolean {
+	const text = extractTextFromContent(content)
+	if (!text) {
+		return false
+	}
+
+	return text.includes('Base directory for this skill:')
+}
+
+function hasPriorSkillToolUse(request: AnthropicMessagesRequest): boolean {
+	return request.messages.some((message) => {
+		if (message.role !== 'assistant' || !Array.isArray(message.content)) {
+			return false
+		}
+
+		return message.content.some(
+			(block) =>
+				block &&
+				typeof block === 'object' &&
+				block.type === 'tool_use' &&
+				block.name === 'Skill',
+		)
+	})
+}
+
+function detectDirectSkillInvocation(request: AnthropicMessagesRequest): DirectSkillInvocation | null {
+	if (!(request.tools ?? []).some((tool) => tool.name === 'Skill')) {
+		return null
+	}
+
+	if (hasPriorSkillToolUse(request)) {
+		return null
+	}
+
+	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+		const message = request.messages[index]
+		if (!message) {
+			continue
+		}
+		if (message.role !== 'user') {
+			continue
+		}
+
+		if (contentContainsLoadedSkillBody(message.content)) {
+			return null
+		}
+
+		const text = extractTextFromContent(message.content)
+		if (!text.trim()) {
+			continue
+		}
+
+		return parseSlashCommand(text)
+	}
+
+	return null
+}
+
+function buildDirectSkillToolUse(invocation: DirectSkillInvocation): AnthropicToolUseBlock {
+	return {
+		type: 'tool_use',
+		id: `toolu_${crypto.randomUUID()}`,
+		name: 'Skill',
+		input: {
+			skill: invocation.skill,
+			...(invocation.args ? { args: invocation.args } : {}),
+		},
+	}
+}
+
+function buildDirectSkillResponse(
+	request: AnthropicMessagesRequest,
+	invocation: DirectSkillInvocation,
+): AnthropicMessagesResponse {
+	return {
+		id: `msg_${crypto.randomUUID()}`,
+		type: 'message',
+		role: 'assistant',
+		model: request.model,
+		content: [buildDirectSkillToolUse(invocation)],
+		stop_reason: 'tool_use',
+		stop_sequence: null,
+		usage: {
+			input_tokens: 0,
+			output_tokens: 0,
+		},
+	}
+}
+
+function formatSyntheticSse(event: string, payload: unknown): Uint8Array {
+	return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
+}
+
+function createDirectSkillStream(
+	request: AnthropicMessagesRequest,
+	invocation: DirectSkillInvocation,
+	logger?: {
+		onSessionReady?: (metadata: { model: string; threadId?: string }) => void | Promise<void>
+		onComplete?: (payload: {
+			stopReason: 'tool_use'
+			usage: {
+				input_tokens: number
+				output_tokens: number
+				cache_read_input_tokens: number
+				reasoning_output_tokens: number
+				total_tokens: number
+			}
+			decision: {
+				kind: 'tool_use'
+				name: string
+				input: Record<string, unknown>
+				preamble: null
+			}
+			metadata: { model: string }
+		}) => void | Promise<void>
+	},
+): ReadableStream<Uint8Array> {
+	const response = buildDirectSkillResponse(request, invocation)
+	const block = response.content[0] as AnthropicToolUseBlock
+	const input = block.input as Record<string, unknown>
+
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			void logger?.onSessionReady?.({ model: request.model })
+
+			controller.enqueue(
+				formatSyntheticSse('message_start', {
+					type: 'message_start',
+					message: {
+						id: response.id,
+						type: 'message',
+						role: 'assistant',
+						model: response.model,
+						content: [],
+						stop_reason: null,
+						stop_sequence: null,
+						usage: response.usage,
+					},
+				}),
+			)
+			controller.enqueue(
+				formatSyntheticSse('content_block_start', {
+					type: 'content_block_start',
+					index: 0,
+					content_block: block,
+				}),
+			)
+			controller.enqueue(
+				formatSyntheticSse('content_block_delta', {
+					type: 'content_block_delta',
+					index: 0,
+					delta: {
+						type: 'input_json_delta',
+						partial_json: JSON.stringify(input),
+					},
+				}),
+			)
+			controller.enqueue(
+				formatSyntheticSse('content_block_stop', {
+					type: 'content_block_stop',
+					index: 0,
+				}),
+			)
+			controller.enqueue(
+				formatSyntheticSse('message_delta', {
+					type: 'message_delta',
+					delta: {
+						stop_reason: 'tool_use',
+						stop_sequence: null,
+					},
+					usage: {
+						output_tokens: 0,
+					},
+				}),
+			)
+			controller.enqueue(
+				formatSyntheticSse('message_stop', {
+					type: 'message_stop',
+				}),
+			)
+			controller.close()
+
+			void logger?.onComplete?.({
+				stopReason: 'tool_use',
+				usage: {
+					input_tokens: 0,
+					output_tokens: 0,
+					cache_read_input_tokens: 0,
+					reasoning_output_tokens: 0,
+					total_tokens: 0,
+				},
+				decision: {
+					kind: 'tool_use',
+					name: 'Skill',
+					input,
+					preamble: null,
+				},
+				metadata: {
+					model: request.model,
+				},
+			})
+		},
+	})
 }
 
 function buildHealthPayload(
@@ -403,6 +698,70 @@ export function createApp(): AppFactoryResult {
 			abortSignal: c.req.raw.signal,
 		}
 		const stream = request.stream === true
+		const directSkillInvocation = detectDirectSkillInvocation(request)
+
+		if (directSkillInvocation) {
+			const toolInputSummary = summarizeToolInputForCapture({
+				skill: directSkillInvocation.skill,
+				...(directSkillInvocation.args ? { args: directSkillInvocation.args } : {}),
+			})
+			if (!stream) {
+				const response = buildDirectSkillResponse(request, directSkillInvocation)
+				await captureRouterResponse(config, traceContext, {
+					status: 200,
+					duration_ms: Date.now() - startedAt,
+					stop_reason: response.stop_reason,
+					codex_model: response.model,
+					...pickUsageForCapture(response.usage),
+					decision_kind: 'tool_use',
+					tool_use_name: 'Skill',
+					...toolInputSummary,
+				})
+				if (logRequests) {
+					logRouterLine(
+						`POST /v1/messages status=200 direct_skill_route skill=${directSkillInvocation.skill}`,
+					)
+				}
+				return c.json(response, 200)
+			}
+
+			const streamResponse = createDirectSkillStream(request, directSkillInvocation, {
+				onSessionReady: () => {
+					void captureRouterStreamEvent(config, traceContext, {
+						stream_phase: 'opened',
+						duration_ms: Date.now() - startedAt,
+						status: 200,
+					})
+					if (logRequests) {
+						logRouterLine(
+							`POST /v1/messages stream started direct_skill_route skill=${directSkillInvocation.skill}`,
+						)
+					}
+				},
+				onComplete: () => {
+					void captureRouterStreamEvent(config, traceContext, {
+						stream_phase: 'completed',
+						duration_ms: Date.now() - startedAt,
+						status: 200,
+						stream_end_reason: 'tool_use',
+						codex_model: request.model,
+						usage_input_tokens: 0,
+						usage_output_tokens: 0,
+						usage_cached_input_tokens: 0,
+						usage_reasoning_output_tokens: 0,
+						usage_total_tokens: 0,
+						decision_kind: 'tool_use',
+						tool_use_name: 'Skill',
+						...toolInputSummary,
+					})
+				},
+			})
+
+			return new Response(streamResponse, {
+				status: 200,
+				headers: toStreamHeaders(),
+			})
+		}
 
 		if (!stream) {
 			try {
@@ -460,6 +819,15 @@ export function createApp(): AppFactoryResult {
 						'decision' in payload && payload.decision?.kind === 'tool_use'
 							? payload.decision.name
 							: null
+					const toolInputSummary =
+						'decision' in payload && payload.decision?.kind === 'tool_use'
+							? summarizeToolInputForCapture(payload.decision.input)
+							: {
+									tool_use_input_preview: null,
+									tool_use_file_path: null,
+									tool_use_path: null,
+									tool_use_pattern: null,
+								}
 					void captureRouterStreamEvent(
 						config,
 						traceContext,
@@ -472,6 +840,7 @@ export function createApp(): AppFactoryResult {
 							...pickUsageForCapture(payload.usage),
 							prompt_metrics: (payload as { promptMetrics?: CodexPromptMetrics }).promptMetrics,
 							tool_use_name: toolUseName,
+							...toolInputSummary,
 							conversation_id: extractConversationId(payload.metadata),
 						},
 					)

@@ -62,6 +62,10 @@ export interface RouterResponseTrace {
 	stream_end_reason?: string | null
 	decision_kind?: CodexBridgeDecision['kind'] | null
 	tool_use_name?: string | null
+	tool_use_input_preview?: string | null
+	tool_use_file_path?: string | null
+	tool_use_path?: string | null
+	tool_use_pattern?: string | null
 }
 
 function getHeader(headers: Headers, key: string): string | null {
@@ -196,6 +200,10 @@ export async function captureRouterStreamEvent(
 		usage_output_tokens?: number | null
 		decision_kind?: CodexBridgeDecision['kind'] | null
 		tool_use_name?: string | null
+		tool_use_input_preview?: string | null
+		tool_use_file_path?: string | null
+		tool_use_path?: string | null
+		tool_use_pattern?: string | null
 	},
 ) {
 	if (!config.captureResponses) {

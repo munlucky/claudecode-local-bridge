@@ -35,6 +35,10 @@ export type ToolExecutionHint = {
 	status: 'resolved' | 'pending'
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
 const TOOL_MAPPING_RULES: ToolMappingRule[] = [
 	{
 		match: (name) =>
@@ -170,6 +174,29 @@ function summarizeJsonValue(value: unknown, limit = 280): string {
 				})()
 
 	return raw.length > limit ? `${raw.slice(0, limit - 3)}...` : raw
+}
+
+function normalizeInputSchemaToStrictObject(
+	toolName: string,
+	inputSchema: AnthropicMessagesRequest['tools'][number]['input_schema'],
+): void {
+	if (!isPlainObject(inputSchema)) {
+		throw new AnthropicRequestValidationError(
+			`tool '${toolName}' input_schema 는 object 여야 합니다.`,
+			400,
+		)
+	}
+
+	if (inputSchema.type !== 'object') {
+		throw new AnthropicRequestValidationError(
+			`tool '${toolName}' input_schema.type 은 'object' 여야 합니다.`,
+			400,
+		)
+	}
+
+	if (inputSchema.additionalProperties !== false) {
+		inputSchema.additionalProperties = false
+	}
 }
 
 function normalizeConversationSeedSegment(value: string): string {
@@ -311,12 +338,12 @@ function serializeBlocks(blocks: AnthropicInputContentBlock[]): string {
 				break
 			case 'tool_use':
 				lines.push(
-					`[tool_use id=${block.id} name=${block.name}] ${JSON.stringify(block.input ?? {})}`,
+					`Tool request ${block.name} (${block.id}): ${JSON.stringify(block.input ?? {})}`,
 				)
 				break
 			case 'tool_result':
 				lines.push(
-					`[tool_result tool_use_id=${block.tool_use_id}] ${
+					`Tool result for ${block.tool_use_id}: ${
 						typeof block.content === 'string'
 							? block.content
 							: JSON.stringify(block.content)
@@ -864,6 +891,7 @@ export function validateAnthropicRequestSemantics(request: AnthropicMessagesRequ
 		if (!tool.name.trim()) {
 			throw new AnthropicRequestValidationError('tool.name 은 비어 있을 수 없습니다.', 400)
 		}
+		normalizeInputSchemaToStrictObject(tool.name, tool.input_schema)
 		if (!isToolSchemaStrict(tool.input_schema)) {
 			throw new AnthropicRequestValidationError(
 				`tool '${tool.name}' input_schema 는 strict object schema(type=object, additionalProperties=false)여야 합니다.`,

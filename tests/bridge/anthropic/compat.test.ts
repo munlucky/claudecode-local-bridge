@@ -85,8 +85,8 @@ describe('Anthropic/Codex mapping', () => {
 		expect(developerInstructions).toContain('Tool equivalence guidance')
 		expect(developerInstructions).toContain('External tool loop contract')
 		expect(prompt).toContain('"name": "read_file"')
-		expect(prompt).toContain('[tool_use id=toolu_1 name=read_file]')
-		expect(prompt).toContain('[tool_result tool_use_id=toolu_1] done')
+		expect(prompt).toContain('Tool request read_file (toolu_1): {"path":"README.md"}')
+		expect(prompt).toContain('Tool result for toolu_1: done')
 		expect(prompt).toContain('continue')
 		expect(prompt).toContain('return it as strict JSON')
 		expect(prompt).toContain('Tool mapping hints')
@@ -370,7 +370,27 @@ describe('Anthropic/Codex mapping', () => {
 		).toThrow(AnthropicRequestValidationError)
 	})
 
-	test('rejects non-strict tool schemas', () => {
+	test('normalizes non-strict tool schemas to satisfy strict requirements', () => {
+		const request = {
+			model: 'claude-sonnet-4-5-20250929',
+			max_tokens: 128,
+			messages: [{ role: 'user', content: 'hello' }],
+			tools: [
+				{
+					name: 'Read',
+					input_schema: {
+						type: 'object',
+						properties: { file_path: { type: 'string' } },
+					},
+				},
+			],
+		}
+
+		expect(() => validateAnthropicRequestSemantics(request)).not.toThrow()
+		expect(request.tools?.[0].input_schema.additionalProperties).toBe(false)
+	})
+
+	test('rejects non-object tool schemas', () => {
 		expect(() =>
 			validateAnthropicRequestSemantics({
 				model: 'claude-sonnet-4-5-20250929',
@@ -379,13 +399,10 @@ describe('Anthropic/Codex mapping', () => {
 				tools: [
 					{
 						name: 'Read',
-						input_schema: {
-							type: 'object',
-							properties: { file_path: { type: 'string' } },
-						},
+						input_schema: 'not-an-object' as unknown as any,
 					},
 				],
 			}),
-		).toThrow('strict object schema')
+		).toThrow('object 여야 합니다')
 	})
 })

@@ -33,6 +33,20 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
+function normalizeToolInputSchema(toolName: string, inputSchema: AnthropicToolDefinition['input_schema']): void {
+	if (!isPlainObject(inputSchema)) {
+		throw new Error(`tool '${toolName}' input_schema 는 object 여야 합니다.`)
+	}
+
+	if (inputSchema.type !== 'object') {
+		throw new Error(`tool '${toolName}' input_schema.type 은 'object' 여야 합니다.`)
+	}
+
+	if (inputSchema.additionalProperties !== false) {
+		inputSchema.additionalProperties = false
+	}
+}
+
 export function validateAnthropicToolDefinitions(tools: AnthropicToolDefinition[]): void {
 	const seenNames = new Set<string>()
 	for (const tool of tools) {
@@ -44,17 +58,7 @@ export function validateAnthropicToolDefinitions(tools: AnthropicToolDefinition[
 			throw new Error(`중복된 tool 이름입니다: ${tool.name}`)
 		}
 		seenNames.add(normalizedName)
-		if (!isPlainObject(tool.input_schema)) {
-			throw new Error(`tool '${tool.name}' input_schema 는 object 여야 합니다.`)
-		}
-		if (tool.input_schema.type !== 'object') {
-			throw new Error(`tool '${tool.name}' input_schema.type 은 'object' 여야 합니다.`)
-		}
-		if (tool.input_schema.additionalProperties !== false) {
-			throw new Error(
-				`tool '${tool.name}' input_schema.additionalProperties 는 false 여야 합니다.`,
-			)
-		}
+		normalizeToolInputSchema(tool.name, tool.input_schema)
 	}
 }
 

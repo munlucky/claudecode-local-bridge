@@ -188,6 +188,206 @@ describe('Ollama router integration', () => {
 		}
 	})
 
+	test('routes explicit slash command to Skill tool without provider call', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			restoreFetch(async () => {
+				throw new Error('provider should not be called for direct skill routing')
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						messages: [{ role: 'user', content: '/moonshot-phase-runner docs/implementation/ --prepare-only' }],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = (await response.json()) as {
+				stop_reason: string
+				content: Array<{ type: string; name?: string; input?: Record<string, unknown> }>
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.stop_reason).toBe('tool_use')
+			expect(payload.content).toEqual([
+				{
+					type: 'tool_use',
+					id: expect.stringMatching(/^toolu_/),
+					name: 'Skill',
+					input: {
+						skill: 'moonshot-phase-runner',
+						args: 'docs/implementation/ --prepare-only',
+					},
+				},
+			])
+		} finally {
+			restore()
+		}
+	})
+
+	test('does not re-route after a prior Skill tool_use already exists in the conversation', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			let providerCalls = 0
+			restoreFetch(async () => {
+				providerCalls += 1
+				return Response.json(readJsonFixture('08-openai-chat-response.json'))
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						messages: [
+							{
+								role: 'assistant',
+								content: [
+									{
+										type: 'tool_use',
+										id: 'toolu_existing',
+										name: 'Skill',
+										input: {
+											skill: 'moonshot-phase-runner',
+											args: 'docs/implementation/00-master-plan-v1.md 개발 진행',
+										},
+									},
+								],
+							},
+							{
+								role: 'user',
+								content:
+									'Base directory for this skill: /tmp/skill\n\n# Moonshot Phase Runner\n\n## Usage\n/moonshot-phase-runner docs/implementation/00-master-plan-v1.md 개발 진행',
+							},
+						],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = (await response.json()) as {
+				stop_reason: string
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.stop_reason).toBe('end_turn')
+			expect(providerCalls).toBe(1)
+		} finally {
+			restore()
+		}
+	})
+
+	test('does not treat loaded skill body text as a fresh slash command', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			let providerCalls = 0
+			restoreFetch(async () => {
+				providerCalls += 1
+				return Response.json(readJsonFixture('08-openai-chat-response.json'))
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						messages: [
+							{
+								role: 'user',
+								content:
+									'Base directory for this skill: /tmp/skill\n\n# Moonshot Phase Runner\n\n## Usage\n/moonshot-phase-runner [<plan-dir>] [--autonomous] [--execution-mode <mode>] [--prepare-only]',
+							},
+						],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = (await response.json()) as {
+				stop_reason: string
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.stop_reason).toBe('end_turn')
+			expect(providerCalls).toBe(1)
+		} finally {
+			restore()
+		}
+	})
+
 	test('streams ollama events without thinking output', async () => {
 		const restore = restoreEnv({
 			BRIDGE_BACKEND: 'ollama',
@@ -242,6 +442,195 @@ describe('Ollama router integration', () => {
 			expect(payload).toContain('event: message_stop')
 			expect(payload).not.toContain('internal')
 			expect(payload).not.toContain('next')
+		} finally {
+			restore()
+		}
+	})
+
+	test('streams explicit slash command as Skill tool_use without provider call', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			restoreFetch(async () => {
+				throw new Error('provider should not be called for direct skill routing')
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						stream: true,
+						messages: [{ role: 'user', content: '/moonshot-phase-runner docs/implementation/ 개발 진행' }],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = await response.text()
+
+			expect(response.status).toBe(200)
+			expect(payload).toContain('event: content_block_start')
+			expect(payload).toContain('"type":"tool_use"')
+			expect(payload).toContain('"name":"Skill"')
+			expect(payload).toContain('"skill":"moonshot-phase-runner"')
+			expect(payload).toContain('docs/implementation/ 개발 진행')
+			expect(payload).toContain('"stop_reason":"tool_use"')
+		} finally {
+			restore()
+		}
+	})
+
+	test('routes slash command embedded later in a user message to Skill tool', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			restoreFetch(async () => {
+				throw new Error('provider should not be called for embedded slash-command routing')
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						messages: [
+							{
+								role: 'user',
+								content:
+									'<system-reminder>skill already loaded</system-reminder>\n/moonshot-phase-runner docs/implementation/00-master-plan-v1.md 개발 진행',
+							},
+						],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = (await response.json()) as {
+				stop_reason: string
+				content: Array<{ type: string; name?: string; input?: Record<string, unknown> }>
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.stop_reason).toBe('tool_use')
+			expect(payload.content[0]).toMatchObject({
+				type: 'tool_use',
+				name: 'Skill',
+				input: {
+					skill: 'moonshot-phase-runner',
+					args: 'docs/implementation/00-master-plan-v1.md 개발 진행',
+				},
+			})
+		} finally {
+			restore()
+		}
+	})
+
+	test('routes command-name tag to Skill tool when slash line is absent', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'ollama',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			OLLAMA_MODEL: 'qwen3.5:27b',
+		})
+
+		try {
+			restoreFetch(async () => {
+				throw new Error('provider should not be called for command-name routing')
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(
+				new Request('http://127.0.0.1:3000/v1/messages', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json',
+					},
+					body: JSON.stringify({
+						model: 'claude-sonnet-4-6',
+						max_tokens: 256,
+						messages: [
+							{
+								role: 'user',
+								content:
+									'<command-name>moonshot-phase-runner</command-name>\nMoonshot Phase Runner skill instructions...',
+							},
+						],
+						tools: [
+							{
+								name: 'Skill',
+								description: 'Execute a skill',
+								input_schema: {
+									type: 'object',
+									properties: {
+										skill: { type: 'string' },
+										args: { type: 'string' },
+									},
+									required: ['skill'],
+									additionalProperties: false,
+								},
+							},
+						],
+					}),
+				}),
+			)
+			const payload = (await response.json()) as {
+				stop_reason: string
+				content: Array<{ type: string; name?: string; input?: Record<string, unknown> }>
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.stop_reason).toBe('tool_use')
+			expect(payload.content[0]).toMatchObject({
+				type: 'tool_use',
+				name: 'Skill',
+				input: {
+					skill: 'moonshot-phase-runner',
+				},
+			})
 		} finally {
 			restore()
 		}

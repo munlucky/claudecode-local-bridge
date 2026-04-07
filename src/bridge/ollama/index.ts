@@ -5,6 +5,7 @@ import type {
 	AnthropicMessagesRequest,
 	AnthropicMessagesResponse,
 	AnthropicResponseContentBlock,
+	AnthropicToolDefinition,
 	AnthropicToolUseBlock,
 	JsonObject,
 } from '../../shared/index.js'
@@ -79,6 +80,14 @@ type OpenAIChatResponse = {
 }
 
 type OllamaLikeResponse = OllamaRawResponse | OpenAIChatResponse
+
+type OpenAIToolCallAccumulatorEntry = {
+	key: string
+	id?: string
+	index?: number
+	functionName: string
+	argumentsText: string
+}
 
 type OllamaResponseShape = 'ollama' | 'openai'
 
@@ -299,8 +308,12 @@ function mapOllamaDoneReason(
 	doneReason: OllamaDoneReason | undefined,
 	hasToolCalls: boolean,
 ): OllamaStopReason {
+	if (hasToolCalls) {
+		return 'tool_use'
+	}
+
 	if (!doneReason) {
-		return hasToolCalls ? 'tool_use' : 'end_turn'
+		return 'end_turn'
 	}
 
 	switch (doneReason) {
@@ -309,14 +322,14 @@ function mapOllamaDoneReason(
 			return 'end_turn'
 		case 'tool_calls':
 		case 'tool_use':
-			return 'tool_use'
+			return 'end_turn'
 		case 'length':
 		case 'max_tokens':
 			return 'max_tokens'
 		case 'stop_sequence':
 			return 'stop_sequence'
 		default:
-			return hasToolCalls ? 'tool_use' : 'end_turn'
+			return 'end_turn'
 	}
 }
 
@@ -340,13 +353,16 @@ function mapAnthropicContentToText(content: unknown): string {
 				return typed.text
 			}
 
-			if (typed.type === 'tool_use' && typeof typed.name === 'string') {
-				const args = typeof typed.input === 'string' ? typed.input : JSON.stringify(typed.input ?? {})
-				return `[tool_use name=${typed.name} args=${args}]`
+			if (typed.type === 'tool_use') {
+				return ''
 			}
 
 			if (typed.type === 'tool_result' && typeof typed.tool_use_id === 'string') {
-				return `[tool_result id=${typed.tool_use_id}]`
+				const resultText = mapAnthropicContentToText(typed.content)
+				if (resultText.trim()) {
+					return `Tool result (${typed.tool_use_id}): ${resultText}`
+				}
+				return `Tool result (${typed.tool_use_id}).`
 			}
 
 			return ''
@@ -528,6 +544,83 @@ function normalizeOpenAICalls(rawToolCalls?: OpenAIChatMessage['tool_calls']): O
 		}))
 }
 
+function buildOpenAIToolCallAccumulatorKey(
+	toolCall: NonNullable<OpenAIChatMessage['tool_calls']>[number],
+	position: number,
+): string {
+	if (typeof toolCall?.index === 'number') {
+		return `index:${toolCall.index}`
+	}
+
+	if (typeof toolCall?.id === 'string' && toolCall.id.trim()) {
+		return `id:${toolCall.id.trim()}`
+	}
+
+	return `position:${position}`
+}
+
+function accumulateOpenAIToolCalls(
+	accumulator: Map<string, OpenAIToolCallAccumulatorEntry>,
+	rawToolCalls?: OpenAIChatMessage['tool_calls'],
+) {
+	if (!rawToolCalls?.length) {
+		return
+	}
+
+	for (const [position, toolCall] of rawToolCalls.entries()) {
+		const key = buildOpenAIToolCallAccumulatorKey(toolCall, position)
+		const existing = accumulator.get(key) ?? {
+			key,
+			functionName: '',
+			argumentsText: '',
+		}
+
+		if (typeof toolCall?.id === 'string' && toolCall.id.trim()) {
+			existing.id = toolCall.id.trim()
+		}
+
+		if (typeof toolCall?.index === 'number') {
+			existing.index = toolCall.index
+		}
+
+		if (toolCall?.function && typeof toolCall.function === 'object') {
+			if (typeof toolCall.function.name === 'string' && toolCall.function.name.length > 0) {
+				existing.functionName += toolCall.function.name
+			}
+
+			if (typeof toolCall.function.arguments === 'string' && toolCall.function.arguments.length > 0) {
+				existing.argumentsText += toolCall.function.arguments
+			}
+
+			if (isObject(toolCall.function.arguments)) {
+				existing.argumentsText = JSON.stringify(toolCall.function.arguments)
+			}
+		}
+
+		accumulator.set(key, existing)
+	}
+}
+
+function finalizeAccumulatedOpenAIToolCalls(
+	accumulator: Map<string, OpenAIToolCallAccumulatorEntry>,
+): OllamaRawToolCall[] {
+	return Array.from(accumulator.values())
+		.sort((left, right) => {
+			const leftIndex = typeof left.index === 'number' ? left.index : Number.MAX_SAFE_INTEGER
+			const rightIndex = typeof right.index === 'number' ? right.index : Number.MAX_SAFE_INTEGER
+			return leftIndex - rightIndex
+		})
+		.map((entry) => ({
+			id: entry.id?.trim() || `call_${crypto.randomUUID()}`,
+			function: {
+				name: entry.functionName.trim() || undefined,
+				arguments: parseModelFromArguments(entry.argumentsText),
+				index: entry.index,
+			},
+		}))
+		.filter((toolCall) => Boolean(toolCall.function?.name))
+}
+
 function isOpenAIChatResponse(response: OllamaLikeResponse): response is OpenAIChatResponse {
 	if (!isObject(response)) {
 		return false
@@ -591,6 +684,117 @@ function extractUsageCounts(response: OllamaLikeResponse) {
 	}
 }
 
+function buildAllowedToolMap(tools?: AnthropicToolDefinition[]): Map<string, AnthropicToolDefinition> {
+	return new Map(
+		(tools ?? [])
+			.filter((tool): tool is AnthropicToolDefinition => Boolean(tool?.name?.trim()))
+			.map((tool) => [tool.name, tool]),
+	)
+}
+
+function hasRequiredToolArguments(tool: AnthropicToolDefinition | undefined, input: JsonObject): boolean {
+	if (!tool || !isObject(tool.input_schema)) {
+		return true
+	}
+
+	const required = Array.isArray(tool.input_schema.required)
+		? tool.input_schema.required.filter((value): value is string => typeof value === 'string' && value.length > 0)
+		: []
+
+	if (required.length === 0) {
+		return true
+	}
+
+	const properties = isObject(tool.input_schema.properties) ? tool.input_schema.properties : {}
+	return required.every((field) => {
+		if (!(field in input)) {
+			return false
+		}
+
+		const value = input[field]
+		if (typeof value === 'string') {
+			return value.trim().length > 0
+		}
+
+			const propertySchema = properties[field]
+			if (isObject(propertySchema) && propertySchema.type === 'string') {
+				return false
+			}
+
+		return value !== undefined && value !== null
+	})
+}
+
+function parseBracketToolUseText(
+	content: string | undefined,
+	allowedTools?: Map<string, AnthropicToolDefinition>,
+): OllamaRawToolCall | null {
+	if (typeof content !== 'string') {
+		return null
+	}
+
+	const trimmed = content.trim()
+	const match = /^\[tool_use\s+name=([^\s\]]+)\s+args=([\s\S]*)\]$/.exec(trimmed)
+	if (!match) {
+		return null
+	}
+
+	const [, name, rawArgs] = match
+	if (!name || typeof rawArgs !== 'string') {
+		return null
+	}
+
+	if (allowedTools && allowedTools.size > 0 && !allowedTools.has(name)) {
+		return null
+	}
+
+	const parsedArguments = parseModelFromArguments(rawArgs)
+	if (!hasRequiredToolArguments(allowedTools?.get(name), parsedArguments)) {
+		return null
+	}
+
+	return {
+		id: `call_${crypto.randomUUID()}`,
+		function: {
+			name,
+			arguments: parsedArguments,
+		},
+	}
+}
+
+function filterToolCallsBySchema(
+	toolCalls: OllamaRawToolCall[],
+	allowedTools?: Map<string, AnthropicToolDefinition>,
+): OllamaRawToolCall[] {
+	if (!toolCalls.length) {
+		return []
+	}
+
+	return toolCalls.filter((toolCall) => {
+		const name = toolCall.function?.name?.trim()
+		if (!name) {
+			return false
+		}
+
+		if (allowedTools && allowedTools.size > 0 && !allowedTools.has(name)) {
+			return false
+		}
+
+		const parsedArguments = parseModelFromArguments(toolCall.function?.arguments)
+		return hasRequiredToolArguments(allowedTools?.get(name), parsedArguments)
+	})
+}
+
+function isPossibleBracketToolUsePrefix(content: string): boolean {
+	const trimmed = content.trimStart()
+	if (!trimmed) {
+		return false
+	}
+
+	const prefix = '[tool_use'
+	return prefix.startsWith(trimmed) || trimmed.startsWith(prefix)
+}
+
 export function mapToolCallsToAnthropicContent(
 	toolCalls?: OllamaRawToolCall[],
 ): AnthropicResponseContentBlock[] {
@@ -647,13 +851,22 @@ function normalizeUsage(
 export function mapOllamaTurnToAnthropic(
 	response: OllamaLikeResponse,
 	requestedModel: string,
+	tools?: AnthropicToolDefinition[],
 ): AnthropicMessagesResponse {
 	const contentText = extractContent(response)
-	const toolCalls = mapToolCallsToAnthropicContent(extractToolCalls(response))
+	const allowedTools = buildAllowedToolMap(tools)
+	const extractedToolCalls = filterToolCallsBySchema(extractToolCalls(response), allowedTools)
+	const fallbackTextToolCall =
+		extractedToolCalls.length === 0
+			? parseBracketToolUseText(contentText, allowedTools)
+			: null
+	const toolCalls = mapToolCallsToAnthropicContent(
+		fallbackTextToolCall ? [fallbackTextToolCall] : extractedToolCalls,
+	)
 	const usage = mapOllamaUsageToAnthropic(response)
 	const content: AnthropicResponseContentBlock[] = []
 
-	if (typeof contentText === 'string' && contentText.length > 0) {
+	if (!fallbackTextToolCall && typeof contentText === 'string' && contentText.length > 0) {
 		content.push({
 			type: 'text',
 			text: contentText,
@@ -679,7 +892,7 @@ export function mapOllamaTurnToAnthropic(
 		role: 'assistant',
 		model: response.model ?? requestedModel,
 		content,
-		stop_reason: toolCalls.length > 0 ? 'tool_use' : stopReason,
+		stop_reason: stopReason,
 		stop_sequence: null,
 		usage,
 	}
@@ -725,7 +938,11 @@ export async function runOllamaTurn(
 		})
 
 		return {
-			response: mapOllamaTurnToAnthropic(body, request.model),
+			response: mapOllamaTurnToAnthropic(
+				body,
+				request.model,
+				request.tools,
+			),
 		}
 	} finally {
 		requestSignal.cleanup()
@@ -912,7 +1129,6 @@ export function streamOllamaTurn(
 					)
 				}
 
-				messageText += delta
 				safeEnqueue(
 					formatSse('content_block_delta', {
 						type: 'content_block_delta',
@@ -943,7 +1159,7 @@ export function streamOllamaTurn(
 					return
 				}
 
-				const tools = buildToolBlocksFromRawToolCalls(dedupeToolCallsById(toolCalls))
+				const tools = buildToolBlocksFromRawToolCalls(getResolvedToolCalls())
 				for (const { index, block } of tools) {
 					const blockIndex = textStreamStarted ? index + 1 : index
 					safeEnqueue(
@@ -980,16 +1196,39 @@ export function streamOllamaTurn(
 			}
 
 			const finish = (finalReason: OllamaStopReason) => {
+				if (hasTools && toolCalls.length === 0 && pendingToolSyntaxText) {
+						const fallbackTextToolCall = parseBracketToolUseText(pendingToolSyntaxText, allowedTools)
+					if (fallbackTextToolCall) {
+						toolCalls.push(fallbackTextToolCall)
+						messageText = ''
+						pendingToolSyntaxText = ''
+					} else {
+						flushPendingToolSyntaxText()
+					}
+				}
+
 				flushTextStop()
 				if (hasTools) {
 					flushToolBlocks()
 				}
-				stopStream(finalReason, usage.output_tokens)
+				const finalToolCalls = getResolvedToolCalls()
+				const effectiveReason = finalToolCalls.length > 0 ? 'tool_use' : finalReason
+				const firstToolCall = finalToolCalls[0]
+				stopStream(effectiveReason, usage.output_tokens)
 				if (!isErrorState) {
 					void logger?.onComplete?.({
-						stopReason: finalReason,
+						stopReason: effectiveReason,
 						usage,
 						finalText: messageText,
+						decision:
+							firstToolCall
+								? {
+										kind: 'tool_use',
+										name: firstToolCall.function?.name,
+										input: parseModelFromArguments(firstToolCall.function?.arguments),
+										preamble: null,
+									}
+								: undefined,
 						metadata: {
 							model: resolvedModel,
 						},
@@ -1007,8 +1246,54 @@ export function streamOllamaTurn(
 			let messageText = ''
 			let usage = mapOllamaUsageToAnthropic({})
 			const toolCalls: OllamaRawToolCall[] = []
+			const accumulatedOpenAIToolCalls = new Map<string, OpenAIToolCallAccumulatorEntry>()
+			const allowedTools = buildAllowedToolMap(request.tools)
+			let pendingToolSyntaxText = ''
+			let toolSyntaxProbeActive = hasTools
 			let didComplete = false
 			let isErrorState = false
+
+			const getResolvedToolCalls = () =>
+				dedupeToolCallsById([
+					...toolCalls,
+					...filterToolCallsBySchema(
+						finalizeAccumulatedOpenAIToolCalls(accumulatedOpenAIToolCalls),
+						allowedTools,
+					),
+				])
+
+			const flushPendingToolSyntaxText = () => {
+				if (!pendingToolSyntaxText) {
+					return
+				}
+
+				sendTextDelta(pendingToolSyntaxText)
+				pendingToolSyntaxText = ''
+				toolSyntaxProbeActive = false
+			}
+
+			const handleContentDelta = (delta: string) => {
+				if (!delta) {
+					return
+				}
+
+				messageText += delta
+				if (!hasTools || toolCalls.length > 0 || !toolSyntaxProbeActive) {
+					sendTextDelta(delta)
+					return
+				}
+
+				const nextCandidate = pendingToolSyntaxText + delta
+				const parsedToolCall = parseBracketToolUseText(nextCandidate, allowedTools)
+				if (parsedToolCall || isPossibleBracketToolUsePrefix(nextCandidate)) {
+					pendingToolSyntaxText = nextCandidate
+					return
+				}
+
+				sendTextDelta(nextCandidate)
+				pendingToolSyntaxText = ''
+				toolSyntaxProbeActive = false
+			}
 
 			const processParsedChunk = (parsed: OllamaLikeResponse) => {
 				logOllamaRawSnapshot('stream', parsed, {
@@ -1020,10 +1305,12 @@ export function streamOllamaTurn(
 
 				const content = extractContent(parsed) ?? ''
 				const thinking = extractThinking(parsed)
-				const incomingToolCalls = extractToolCalls(parsed)
+				const choice = isOpenAIChatResponse(parsed) ? getOpenAIChoice(parsed) : null
+				const rawOpenAIDeltaToolCalls = choice?.delta?.tool_calls
+				const incomingToolCalls = rawOpenAIDeltaToolCalls?.length ? [] : extractToolCalls(parsed)
 
 				if (content) {
-					sendTextDelta(content)
+					handleContentDelta(content)
 				}
 
 				if (
@@ -1031,11 +1318,19 @@ export function streamOllamaTurn(
 					typeof thinking === 'string' &&
 					thinking
 				) {
+					flushPendingToolSyntaxText()
+					messageText += thinking
 					sendTextDelta(thinking)
 				}
 
 				if (incomingToolCalls.length > 0) {
-					toolCalls.push(...incomingToolCalls)
+					flushPendingToolSyntaxText()
+					toolCalls.push(...filterToolCallsBySchema(incomingToolCalls, allowedTools))
+				}
+
+				if (rawOpenAIDeltaToolCalls?.length) {
+					flushPendingToolSyntaxText()
+					accumulateOpenAIToolCalls(accumulatedOpenAIToolCalls, rawOpenAIDeltaToolCalls)
 				}
 
 				const doneReason = extractDoneReason(parsed)
@@ -1043,7 +1338,7 @@ export function streamOllamaTurn(
 				if (done || doneReason) {
 					const finalReason = mapOllamaDoneReason(
 						doneReason as OllamaDoneReason,
-						toolCalls.length > 0,
+						getResolvedToolCalls().length > 0,
 					)
 					finish(finalReason)
 				}
@@ -1108,7 +1403,7 @@ export function streamOllamaTurn(
 				}
 
 				if (!didComplete) {
-					finish(mapOllamaDoneReason(undefined, toolCalls.length > 0))
+					finish(mapOllamaDoneReason(undefined, getResolvedToolCalls().length > 0))
 				}
 			} catch (error) {
 					isErrorState = true

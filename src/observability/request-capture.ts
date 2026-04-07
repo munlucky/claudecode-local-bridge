@@ -1,9 +1,20 @@
 import { buildAnonymousConversationSeed } from '../bridge/anthropic/index.js'
 import { appendFile, mkdir, readdir, rename, stat, unlink } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import type { RouterConfig } from '../server/index.js'
 import type { AnthropicMessagesRequest } from '../shared/index.js'
 import type { RouterTraceContext } from './router-trace.js'
+
+type CapturedToolUsePreview = {
+	role: 'user' | 'assistant' | 'system'
+	id: string
+	name: string
+	input_keys: string[]
+	input_preview: string
+	file_path?: string | null
+	path?: string | null
+	pattern?: string | null
+}
 
 type CapturedAnthropicRequest = {
 	timestamp: string
@@ -21,12 +32,167 @@ type CapturedAnthropicRequest = {
 	tool_choice: unknown
 	tools: unknown
 	anonymous_conversation_seed: string | null
+	recent_tool_uses: CapturedToolUsePreview[]
+	last_user_message_preview: string | null
+	last_user_message_is_slash_command: boolean
+	last_user_message_slash_command: string | null
 	body_parse_error?: string
 }
 
 const SECRET_KEY_PATTERN = /(api[_-]?key|token|authorization|password|secret|cookie)/i
 const ABSOLUTE_PATH_PATTERN =
 	/([A-Za-z]:\\[^"'`\s]+|\/(?:Users|home|tmp|var|opt|etc|mnt|srv)\/[^"'`\s]+)/g
+
+function toWorkspaceRelativePath(value: string): string {
+	const cwd = process.cwd()
+	if (value === cwd) {
+		return '.'
+	}
+
+	if (value.startsWith(`${cwd}/`)) {
+		return relative(cwd, value) || '.'
+	}
+
+	return value
+}
+
+function normalizeToolInputValue(value: unknown): unknown {
+	if (typeof value === 'string') {
+		return toWorkspaceRelativePath(value)
+	}
+
+	if (Array.isArray(value)) {
+		return value.map((entry) => normalizeToolInputValue(entry))
+	}
+
+	if (!value || typeof value !== 'object') {
+		return value
+	}
+
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>).map(([key, entryValue]) => [
+			key,
+			normalizeToolInputValue(entryValue),
+		]),
+	)
+}
+
+function summarizeJsonValue(value: unknown, limit = 240): string {
+	let raw: string
+	try {
+		raw = typeof value === 'string' ? value : JSON.stringify(value)
+	} catch {
+		raw = String(value)
+	}
+
+	return raw.length > limit ? `${raw.slice(0, limit - 3)}...` : raw
+}
+
+function flattenMessageContentToText(content: AnthropicMessagesRequest['messages'][number]['content']): string {
+	if (typeof content === 'string') {
+		return content
+	}
+
+	if (!Array.isArray(content)) {
+		return ''
+	}
+
+	return content
+		.map((block) => {
+			if (!block || typeof block !== 'object') {
+				return ''
+			}
+
+			if (block.type === 'text' && typeof block.text === 'string') {
+				return block.text
+			}
+
+			if (block.type === 'thinking' && typeof block.thinking === 'string') {
+				return block.thinking
+			}
+
+			return ''
+		})
+		.filter(Boolean)
+		.join('\n')
+}
+
+export function collectLastUserMessageSummary(request: AnthropicMessagesRequest | null): {
+	last_user_message_preview: string | null
+	last_user_message_is_slash_command: boolean
+	last_user_message_slash_command: string | null
+} {
+	if (!request) {
+		return {
+			last_user_message_preview: null,
+			last_user_message_is_slash_command: false,
+			last_user_message_slash_command: null,
+		}
+	}
+
+	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+		const message = request.messages[index]
+		if (!message || message.role !== 'user') {
+			continue
+		}
+
+		const text = flattenMessageContentToText(message.content).trim()
+		if (!text) {
+			continue
+		}
+
+		const preview = summarizeJsonValue(text, 240)
+		const slashMatch = /^\/([A-Za-z0-9][A-Za-z0-9:_-]*)\b/.exec(text)
+		return {
+			last_user_message_preview: preview,
+			last_user_message_is_slash_command: Boolean(slashMatch),
+			last_user_message_slash_command: slashMatch?.[1] ?? null,
+		}
+	}
+
+	return {
+		last_user_message_preview: null,
+		last_user_message_is_slash_command: false,
+		last_user_message_slash_command: null,
+	}
+}
+
+function collectRecentToolUses(
+	request: AnthropicMessagesRequest | null,
+	limit = 12,
+): CapturedToolUsePreview[] {
+	if (!request) {
+		return []
+	}
+
+	const previews: CapturedToolUsePreview[] = []
+	for (const message of request.messages) {
+		const content = Array.isArray(message.content) ? message.content : []
+		for (const block of content) {
+			if (block.type !== 'tool_use') {
+				continue
+			}
+
+			const normalizedInput =
+				block.input && typeof block.input === 'object' && !Array.isArray(block.input)
+					? (normalizeToolInputValue(block.input) as Record<string, unknown>)
+					: {}
+			previews.push({
+				role: message.role,
+				id: block.id,
+				name: block.name,
+				input_keys: Object.keys(normalizedInput).sort(),
+				input_preview: summarizeJsonValue(normalizedInput),
+				file_path:
+					typeof normalizedInput.file_path === 'string' ? normalizedInput.file_path : null,
+				path: typeof normalizedInput.path === 'string' ? normalizedInput.path : null,
+				pattern: typeof normalizedInput.pattern === 'string' ? normalizedInput.pattern : null,
+			})
+		}
+	}
+
+	return previews.slice(-limit)
+}
 
 export function redactSensitiveValue(value: unknown): unknown {
 	if (typeof value === 'string') {
@@ -124,6 +290,8 @@ function toCapturedRecord(
 		anonymous_conversation_seed: typedRequest
 			? buildAnonymousConversationSeed(typedRequest)
 			: null,
+		recent_tool_uses: collectRecentToolUses(typedRequest),
+		...collectLastUserMessageSummary(typedRequest),
 		...(parseError ? { body_parse_error: parseError } : {}),
 	}
 }

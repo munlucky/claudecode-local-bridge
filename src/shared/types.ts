@@ -50,10 +50,18 @@ export interface AnthropicMessage {
 	content: string | AnthropicInputContentBlock[]
 }
 
-export interface AnthropicThinkingConfig {
-	type: 'enabled'
-	budget_tokens: number
-}
+export type AnthropicThinkingConfig =
+	| {
+			type: 'enabled'
+			budget_tokens: number
+	  }
+	| {
+			type: 'disabled'
+	  }
+	| ({
+			type?: string
+			budget_tokens?: number
+	  } & JsonObject)
 
 export interface AnthropicToolDefinition {
 	name: string
