@@ -1,7 +1,10 @@
 import { serve } from 'bun'
 import { createApp } from './server/index.js'
+import { ensureRuntimeLogSession, getRuntimeLogInfo, logRouterLine } from './observability/index.js'
 
 const { app, config, hasCodexAuthFile } = createApp()
+await ensureRuntimeLogSession(config)
+const runtimeLogInfo = getRuntimeLogInfo(config)
 
 const server = serve({
 	fetch: app.fetch,
@@ -24,8 +27,21 @@ console.log(`[router] codex_runtime_cwd=${config.codexRuntimeCwd}`)
 console.log(`[router] request_logging=${config.logRequests}`)
 console.log(`[router] request_capture=${config.captureRequests}`)
 console.log(`[router] request_capture_path=${config.captureRequestsPath}`)
+console.log(`[router] runtime_logs=${config.runtimeLogsEnabled}`)
+if (runtimeLogInfo) {
+	console.log(`[router] runtime_logs_root=${runtimeLogInfo.rootDir}`)
+	console.log(`[router] runtime_log_run_dir=${runtimeLogInfo.runDir}`)
+	console.log(`[router] runtime_log_latest_dir=${runtimeLogInfo.latestDir}`)
+}
 console.log(`[router] heartbeat_interval_sec=${config.heartbeatIntervalSec}`)
 console.log(`[router] idle_timeout_sec=${config.serverIdleTimeoutSec}`)
+
+if (runtimeLogInfo) {
+	logRouterLine(`runtime log session ready run_id=${runtimeLogInfo.runId}`, {
+		config,
+		stage: 'startup',
+	})
+}
 
 if (config.heartbeatIntervalSec > 0) {
 	setInterval(() => {

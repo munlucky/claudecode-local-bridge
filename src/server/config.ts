@@ -17,6 +17,8 @@ export interface RouterConfig {
 	serverIdleTimeoutSec: number
 	userAgent: string
 	logRequests: boolean
+	runtimeLogsEnabled: boolean
+	runtimeLogsRootPath: string
 	captureRequests: boolean
 	captureRequestsPath: string
 	captureResponses: boolean
@@ -189,6 +191,10 @@ export function loadConfig(): RouterConfig {
 		),
 		userAgent: process.env.ROUTER_USER_AGENT?.trim() || 'claudecode-codex-local-bridge/2.0',
 		logRequests: parseBoolean(process.env.ROUTER_LOG_REQUESTS, true),
+		runtimeLogsEnabled: parseBoolean(process.env.ROUTER_RUNTIME_LOGS, true),
+		runtimeLogsRootPath: expandHomePath(
+			process.env.ROUTER_RUNTIME_LOGS_ROOT?.trim() || '.bridge-logs',
+		),
 		captureRequests: parseBoolean(process.env.ROUTER_CAPTURE_REQUESTS, true),
 		captureRequestsPath: expandHomePath(
 			process.env.ROUTER_CAPTURE_REQUESTS_PATH?.trim() ||

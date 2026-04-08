@@ -4,6 +4,7 @@ import { basename, dirname, join, relative } from 'node:path'
 import type { RouterConfig } from '../server/index.js'
 import type { AnthropicMessagesRequest } from '../shared/index.js'
 import type { RouterTraceContext } from './router-trace.js'
+import { appendRuntimeLog } from './runtime-log.js'
 
 type CapturedToolUsePreview = {
 	role: 'user' | 'assistant' | 'system'
@@ -42,6 +43,24 @@ type CapturedAnthropicRequest = {
 const SECRET_KEY_PATTERN = /(api[_-]?key|token|authorization|password|secret|cookie)/i
 const ABSOLUTE_PATH_PATTERN =
 	/([A-Za-z]:\\[^"'`\s]+|\/(?:Users|home|tmp|var|opt|etc|mnt|srv)\/[^"'`\s]+)/g
+const SAFE_TOKEN_METRIC_KEYS = new Set([
+	'input_tokens',
+	'output_tokens',
+	'total_tokens',
+	'cache_read_input_tokens',
+	'reasoning_output_tokens',
+	'usage_input_tokens',
+	'usage_output_tokens',
+	'usage_cached_input_tokens',
+	'usage_reasoning_output_tokens',
+	'usage_total_tokens',
+	'prompt_tokens',
+	'completion_tokens',
+])
+
+function shouldRedactKey(key: string) {
+	return SECRET_KEY_PATTERN.test(key) && !SAFE_TOKEN_METRIC_KEYS.has(key)
+}
 
 function toWorkspaceRelativePath(value: string): string {
 	const cwd = process.cwd()
@@ -214,7 +233,7 @@ export function redactSensitiveValue(value: unknown): unknown {
 	return Object.fromEntries(
 		Object.entries(object).map(([key, entryValue]) => [
 			key,
-			SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : redactSensitiveValue(entryValue),
+			shouldRedactKey(key) ? '[REDACTED]' : redactSensitiveValue(entryValue),
 		]),
 	)
 }
@@ -333,6 +352,11 @@ export async function captureAnthropicRequest(
 		`${JSON.stringify(redactSensitiveValue(record))}\n`,
 		'utf8',
 	)
+	await appendRuntimeLog(config, {
+		channel: '02-anthropic-requests',
+		routerRequestId: record.router_request_id,
+		payload: record as unknown as Record<string, unknown>,
+	})
 
 	if ((body as { tools?: unknown[] }).tools?.length) {
 		process.stdout.write(

@@ -52,6 +52,8 @@ describe('loadConfig', () => {
 	})
 
 	test('enables request capture by default', () => {
+		delete process.env.ROUTER_RUNTIME_LOGS
+		delete process.env.ROUTER_RUNTIME_LOGS_ROOT
 		delete process.env.ROUTER_CAPTURE_REQUESTS
 		delete process.env.ROUTER_CAPTURE_REQUESTS_PATH
 		delete process.env.ROUTER_CAPTURE_RESPONSES
@@ -59,6 +61,8 @@ describe('loadConfig', () => {
 
 		const config = loadConfig()
 
+		expect(config.runtimeLogsEnabled).toBe(true)
+		expect(config.runtimeLogsRootPath.endsWith('.bridge-logs')).toBe(true)
 		expect(config.captureRequests).toBe(true)
 		expect(config.captureRequestsPath.endsWith('anthropic-requests.jsonl')).toBe(true)
 		expect(config.captureResponses).toBe(true)

@@ -93,6 +93,7 @@ describe('buildRouterTraceContext', () => {
 		const sanitized = redactSensitiveValue({
 			authorization: 'Bearer secret-token-value',
 			file_path: 'C:\\dev\\secret\\token.txt',
+			usage_total_tokens: 321,
 			nested: {
 				api_key: 'sk-test-123456789',
 			},
@@ -100,6 +101,7 @@ describe('buildRouterTraceContext', () => {
 
 		expect(sanitized.authorization).toBe('[REDACTED]')
 		expect(sanitized.file_path).toBe('[REDACTED_PATH]')
+		expect(sanitized.usage_total_tokens).toBe(321)
 		expect((sanitized.nested as Record<string, unknown>).api_key).toBe('[REDACTED]')
 	})
 })

@@ -577,6 +577,7 @@ export function createApp(): AppFactoryResult {
 		if (logRequests) {
 			logRouterLine(
 				`GET /health status=${status} backend=${config.bridgeBackend} auth_dependency=${hasAuthDependency} readiness=${healthReady ? 'ready' : 'degraded'}`,
+				{ config, stage: 'health' },
 			)
 		}
 
@@ -600,7 +601,11 @@ export function createApp(): AppFactoryResult {
 				})
 			}
 			if (logRequests) {
-				logRouterLine(`GET /v1/models status=200 provider=${config.bridgeBackend}`)
+				logRouterLine(`GET /v1/models status=200 provider=${config.bridgeBackend}`, {
+					config,
+					context: requestContext,
+					stage: 'models',
+				})
 			}
 			return c.json(responsePayload)
 		} catch (error) {
@@ -614,7 +619,11 @@ export function createApp(): AppFactoryResult {
 				})
 			}
 			if (logRequests) {
-				logRouterLine(`GET /v1/models status=502 error=${message}`)
+				logRouterLine(`GET /v1/models status=502 error=${message}`, {
+					config,
+					context: requestContext,
+					stage: 'models',
+				})
 			}
 			return toErrorResponse(502, 'failed to load model list', message)
 		}
@@ -653,7 +662,11 @@ export function createApp(): AppFactoryResult {
 				})
 			}
 			if (logRequests) {
-				logRouterLine(`POST /v1/messages status=400 parse_error`)
+				logRouterLine(`POST /v1/messages status=400 parse_error`, {
+					config,
+					context: traceContext,
+					stage: 'messages-parse',
+				})
 			}
 			return toErrorResponse(400, parseError ? 'invalid JSON body' : 'invalid request format')
 		}
@@ -686,7 +699,11 @@ export function createApp(): AppFactoryResult {
 				})
 			}
 			if (logRequests) {
-				logRouterLine(`POST /v1/messages status=${status} validation_error`)
+				logRouterLine(`POST /v1/messages status=${status} validation_error`, {
+					config,
+					context: traceContext,
+					stage: 'messages-validate',
+				})
 			}
 			return toErrorResponse(status, message)
 		}
@@ -720,6 +737,11 @@ export function createApp(): AppFactoryResult {
 				if (logRequests) {
 					logRouterLine(
 						`POST /v1/messages status=200 direct_skill_route skill=${directSkillInvocation.skill}`,
+						{
+							config,
+							context: traceContext,
+							stage: 'direct-skill',
+						},
 					)
 				}
 				return c.json(response, 200)
@@ -735,6 +757,11 @@ export function createApp(): AppFactoryResult {
 					if (logRequests) {
 						logRouterLine(
 							`POST /v1/messages stream started direct_skill_route skill=${directSkillInvocation.skill}`,
+							{
+								config,
+								context: traceContext,
+								stage: 'direct-skill-stream',
+							},
 						)
 					}
 				},
@@ -775,7 +802,11 @@ export function createApp(): AppFactoryResult {
 					codex_model: result.response.model,
 				})
 				if (logRequests) {
-					logRouterLine(`POST /v1/messages status=200 non-stream model=${result.response.model}`)
+					logRouterLine(`POST /v1/messages status=200 non-stream model=${result.response.model}`, {
+						config,
+						context: traceContext,
+						stage: 'messages-non-stream',
+					})
 				}
 				return c.json(result.response, 200)
 			} catch (error) {
@@ -786,6 +817,13 @@ export function createApp(): AppFactoryResult {
 					error_type: 'provider_error',
 					error_message: message,
 				})
+				if (logRequests) {
+					logRouterLine(`POST /v1/messages status=502 non-stream error=${message}`, {
+						config,
+						context: traceContext,
+						stage: 'messages-non-stream',
+					})
+				}
 				return toErrorResponse(502, 'failed to execute message', message)
 			}
 		}
@@ -807,7 +845,11 @@ export function createApp(): AppFactoryResult {
 						},
 					)
 					if (logRequests) {
-						logRouterLine(`POST /v1/messages stream started provider=${config.bridgeBackend}`)
+						logRouterLine(`POST /v1/messages stream started provider=${config.bridgeBackend}`, {
+							config,
+							context: traceContext,
+							stage: 'messages-stream',
+						})
 					}
 				},
 				onComplete: (payload) => {

@@ -9,6 +9,7 @@ import type {
 	CodexThreadReuseReason,
 } from '../shared/index.js'
 import { redactSensitiveValue } from './request-capture.js'
+import { appendRuntimeLog } from './runtime-log.js'
 
 export interface RouterTraceContext {
 	router_request_id: string
@@ -156,8 +157,33 @@ async function appendJsonLine(path: string, value: unknown) {
 	await appendFile(path, `${JSON.stringify(redactSensitiveValue(value))}\n`, 'utf8')
 }
 
-export function logRouterLine(message: string) {
+export function logRouterLine(
+	message: string,
+	options?: {
+		config?: RouterConfig
+		context?: RouterTraceContext
+		stage?: string
+	}
+) {
 	process.stdout.write(`[router] ${new Date().toISOString()} ${message}\n`)
+	if (options?.config) {
+		void appendRuntimeLog(options.config, {
+			channel: '01-router-events',
+			routerRequestId: options.context?.router_request_id ?? null,
+			payload: {
+				level: 'info',
+				stage: options.stage ?? 'router',
+				message,
+				...(options.context
+					? {
+							method: options.context.method,
+							path: options.context.path,
+							router_request_id: options.context.router_request_id,
+						}
+					: {}),
+			},
+		})
+	}
 }
 
 export async function captureRouterResponse(
@@ -174,6 +200,15 @@ export async function captureRouterResponse(
 		type: 'response',
 		...context,
 		...response,
+	})
+	await appendRuntimeLog(config, {
+		channel: '03-anthropic-responses',
+		routerRequestId: context.router_request_id,
+		payload: {
+			type: 'response',
+			...context,
+			...response,
+		},
 	})
 }
 
@@ -215,5 +250,14 @@ export async function captureRouterStreamEvent(
 		type: 'stream',
 		...context,
 		...event,
+	})
+	await appendRuntimeLog(config, {
+		channel: '03-anthropic-responses',
+		routerRequestId: context.router_request_id,
+		payload: {
+			type: 'stream',
+			...context,
+			...event,
+		},
 	})
 }

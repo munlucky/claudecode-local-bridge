@@ -120,6 +120,7 @@ tokens.json
 .claude
 .agents/
 .history/
+.bridge-logs/
 AGENTS.md
 
 # Local virtual environments

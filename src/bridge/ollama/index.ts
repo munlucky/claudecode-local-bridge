@@ -11,6 +11,7 @@ import type {
 } from '../../shared/index.js'
 import { AnthropicRequestValidationError } from '../anthropic/compat.js'
 import type { StreamLifecycleLoggerLike } from '../backend-provider.js'
+import { appendRuntimeLog } from '../../observability/runtime-log.js'
 
 type HeadersInit = Record<string, string> | string[][] | { [key: string]: string }
 
@@ -177,6 +178,7 @@ function buildHeaders(config: RouterConfig): HeadersInit {
 }
 
 function logOllamaRawSnapshot(
+	config: RouterConfig,
 	phase: 'non-stream' | 'stream',
 	payload: OllamaLikeResponse,
 	context?: {
@@ -232,9 +234,15 @@ function logOllamaRawSnapshot(
 			),
 		)
 		.catch(() => undefined)
+	void appendRuntimeLog(config, {
+		channel: '04-ollama-raw',
+		routerRequestId: context?.routerRequestId ?? null,
+		payload: summary as unknown as Record<string, unknown>,
+	})
 }
 
 function logOllamaRawLineIssue(
+	config: RouterConfig,
 	line: string,
 	reason: 'unsupported-sse-meta' | 'parse-failed',
 	context?: {
@@ -254,6 +262,11 @@ function logOllamaRawLineIssue(
 	void mkdir(dirname(logPath), { recursive: true })
 		.then(() => appendFile(logPath, `${JSON.stringify(summary)}\n`, 'utf8'))
 		.catch(() => undefined)
+	void appendRuntimeLog(config, {
+		channel: '05-ollama-raw-lines',
+		routerRequestId: context?.routerRequestId ?? null,
+		payload: summary as unknown as Record<string, unknown>,
+	})
 }
 
 function parseModelFromArguments(raw: string | JsonObject | undefined): JsonObject {
@@ -933,7 +946,7 @@ export async function runOllamaTurn(
 		if (typeof body !== 'object' || body === null) {
 			throw new Error('Ollama 응답 형식이 유효하지 않습니다.')
 		}
-		logOllamaRawSnapshot('non-stream', body, {
+		logOllamaRawSnapshot(config, 'non-stream', body, {
 			routerRequestId: context?.routerRequestId,
 		})
 
@@ -954,6 +967,7 @@ function formatSse(event: string, payload: unknown): Uint8Array {
 }
 
 function parseStreamChunk(
+	config: RouterConfig,
 	line: string,
 	context?: {
 		routerRequestId?: string | null
@@ -965,7 +979,7 @@ function parseStreamChunk(
 	}
 
 	if (trimmed.startsWith('event:')) {
-		logOllamaRawLineIssue(trimmed, 'unsupported-sse-meta', context)
+		logOllamaRawLineIssue(config, trimmed, 'unsupported-sse-meta', context)
 		return null
 	}
 
@@ -993,7 +1007,7 @@ function parseStreamChunk(
 			? (parsed as OllamaLikeResponse)
 			: null
 	} catch {
-		logOllamaRawLineIssue(payload, 'parse-failed', context)
+		logOllamaRawLineIssue(config, payload, 'parse-failed', context)
 		return null
 	}
 }
@@ -1296,7 +1310,7 @@ export function streamOllamaTurn(
 			}
 
 			const processParsedChunk = (parsed: OllamaLikeResponse) => {
-				logOllamaRawSnapshot('stream', parsed, {
+				logOllamaRawSnapshot(config, 'stream', parsed, {
 					routerRequestId: context?.routerRequestId,
 				})
 
@@ -1377,7 +1391,7 @@ export function streamOllamaTurn(
 					pendingChunk = lines.pop() ?? ''
 
 					for (const line of lines) {
-						const parsed = parseStreamChunk(line, {
+						const parsed = parseStreamChunk(config, line, {
 							routerRequestId: context?.routerRequestId,
 						})
 						if (!parsed) {
@@ -1386,7 +1400,7 @@ export function streamOllamaTurn(
 						processParsedChunk(parsed)
 					}
 
-					const tailChunk = parseStreamChunk(pendingChunk, {
+					const tailChunk = parseStreamChunk(config, pendingChunk, {
 						routerRequestId: context?.routerRequestId,
 					})
 					if (!didComplete && tailChunk) {
@@ -1395,7 +1409,7 @@ export function streamOllamaTurn(
 					}
 				}
 
-				const finalChunk = parseStreamChunk(pendingChunk, {
+				const finalChunk = parseStreamChunk(config, pendingChunk, {
 					routerRequestId: context?.routerRequestId,
 				})
 				if (!didComplete && finalChunk) {
