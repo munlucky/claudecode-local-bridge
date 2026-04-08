@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { appendRuntimeLog, ensureRuntimeLogSession, getRuntimeLogInfo } from '../../src/observability/runtime-log.js'
@@ -92,5 +92,21 @@ describe('runtime-log', () => {
 		} else {
 			process.env.OLLAMA_MODEL = restoreOllamaModel
 		}
+	})
+
+	test('gracefully disables runtime logging when initialization fails', async () => {
+		const blockedPath = join(rootDir, 'blocked-root')
+		await writeFile(blockedPath, 'not a directory', 'utf8')
+		process.env.ROUTER_RUNTIME_LOGS_ROOT = blockedPath
+
+		const config = loadConfig()
+
+		await expect(ensureRuntimeLogSession(config)).resolves.toBeNull()
+		await expect(
+			appendRuntimeLog(config, {
+				channel: '01-router-events',
+				payload: { message: 'should not throw' },
+			}),
+		).resolves.toBeUndefined()
 	})
 })

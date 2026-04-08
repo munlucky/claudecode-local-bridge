@@ -179,7 +179,7 @@ function summarizeJsonValue(value: unknown, limit = 280): string {
 function normalizeInputSchemaToStrictObject(
 	toolName: string,
 	inputSchema: NonNullable<AnthropicMessagesRequest['tools']>[number]['input_schema'],
-): void {
+): JsonObject {
 	if (!isPlainObject(inputSchema)) {
 		throw new AnthropicRequestValidationError(
 			`tool '${toolName}' input_schema 는 object 여야 합니다.`,
@@ -194,8 +194,18 @@ function normalizeInputSchemaToStrictObject(
 		)
 	}
 
-	if (inputSchema.additionalProperties !== false) {
-		inputSchema.additionalProperties = false
+	return {
+		...inputSchema,
+		additionalProperties: false,
+	}
+}
+
+function normalizeToolDefinition(
+	tool: NonNullable<AnthropicMessagesRequest['tools']>[number],
+) {
+	return {
+		...tool,
+		input_schema: normalizeInputSchemaToStrictObject(tool.name, tool.input_schema),
 	}
 }
 
@@ -393,7 +403,7 @@ function formatToolDefinitions(request: AnthropicMessagesRequest): string {
 				{
 					name: tool.name,
 					description: tool.description ?? '',
-					input_schema: tool.input_schema,
+					input_schema: normalizeToolDefinition(tool).input_schema,
 				},
 				null,
 				2,
@@ -624,7 +634,7 @@ export function buildCodexPromptMetrics(
 		(request.tools ?? []).map((tool) => ({
 			name: tool.name,
 			description: tool.description ?? '',
-			input_schema: tool.input_schema,
+			input_schema: normalizeToolDefinition(tool).input_schema,
 		})),
 	)
 	const userVisibleText = [
@@ -891,8 +901,8 @@ export function validateAnthropicRequestSemantics(request: AnthropicMessagesRequ
 		if (!tool.name.trim()) {
 			throw new AnthropicRequestValidationError('tool.name 은 비어 있을 수 없습니다.', 400)
 		}
-		normalizeInputSchemaToStrictObject(tool.name, tool.input_schema)
-		if (!isToolSchemaStrict(tool.input_schema)) {
+		const normalizedInputSchema = normalizeInputSchemaToStrictObject(tool.name, tool.input_schema)
+		if (!isToolSchemaStrict(normalizedInputSchema)) {
 			throw new AnthropicRequestValidationError(
 				`tool '${tool.name}' input_schema 는 strict object schema(type=object, additionalProperties=false)여야 합니다.`,
 				400,

@@ -3,8 +3,8 @@ import { createApp } from './server/index.js'
 import { ensureRuntimeLogSession, getRuntimeLogInfo, logRouterLine } from './observability/index.js'
 
 const { app, config, hasCodexAuthFile } = createApp()
-await ensureRuntimeLogSession(config)
-const runtimeLogInfo = getRuntimeLogInfo(config)
+const runtimeLogSession = await ensureRuntimeLogSession(config)
+const runtimeLogInfo = runtimeLogSession ? getRuntimeLogInfo(config) : null
 
 const server = serve({
 	fetch: app.fetch,

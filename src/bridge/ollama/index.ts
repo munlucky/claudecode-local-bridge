@@ -1,6 +1,4 @@
 import type { RouterConfig } from '../../server/config.js'
-import { appendFile, mkdir } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
 import type {
 	AnthropicMessagesRequest,
 	AnthropicMessagesResponse,
@@ -221,19 +219,6 @@ function logOllamaRawSnapshot(
 		total_tokens: usage.totalTokens,
 	}
 	process.stdout.write(`[ollama-raw] ${JSON.stringify(summary)}\n`)
-	const logPath = join(process.cwd(), '.history', 'ollama-raw.jsonl')
-	void mkdir(dirname(logPath), { recursive: true })
-		.then(() =>
-			appendFile(
-				logPath,
-				`${JSON.stringify({
-					timestamp: new Date().toISOString(),
-					...summary,
-				})}\n`,
-				'utf8',
-			),
-		)
-		.catch(() => undefined)
 	void appendRuntimeLog(config, {
 		channel: '04-ollama-raw',
 		routerRequestId: context?.routerRequestId ?? null,
@@ -258,10 +243,6 @@ function logOllamaRawLineIssue(
 		line_length: line.length,
 	}
 	process.stdout.write(`[ollama-raw-line] ${JSON.stringify(summary)}\n`)
-	const logPath = join(process.cwd(), '.history', 'ollama-raw-lines.jsonl')
-	void mkdir(dirname(logPath), { recursive: true })
-		.then(() => appendFile(logPath, `${JSON.stringify(summary)}\n`, 'utf8'))
-		.catch(() => undefined)
 	void appendRuntimeLog(config, {
 		channel: '05-ollama-raw-lines',
 		routerRequestId: context?.routerRequestId ?? null,

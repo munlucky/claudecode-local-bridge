@@ -387,7 +387,7 @@ describe('Anthropic/Codex mapping', () => {
 		}
 
 		expect(() => validateAnthropicRequestSemantics(request)).not.toThrow()
-		expect(request.tools?.[0].input_schema.additionalProperties).toBe(false)
+		expect(request.tools?.[0].input_schema).not.toHaveProperty('additionalProperties')
 	})
 
 	test('rejects non-object tool schemas', () => {

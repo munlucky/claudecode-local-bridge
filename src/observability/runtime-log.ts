@@ -17,6 +17,7 @@ type RuntimeLogState = {
 	runDir: string
 	latestDir: string
 	initialized: boolean
+	disabled: boolean
 }
 
 const RUNTIME_LOG_CHANNELS: RuntimeLogChannel[] = [
@@ -56,6 +57,7 @@ function getRuntimeLogState(config: RouterConfig): RuntimeLogState {
 		runDir: join(rootDir, 'runs', runId),
 		latestDir: join(rootDir, 'latest'),
 		initialized: false,
+		disabled: false,
 	}
 	return runtimeLogState
 }
@@ -79,42 +81,55 @@ export async function ensureRuntimeLogSession(config: RouterConfig) {
 	if (state.initialized) {
 		return state
 	}
+	if (state.disabled) {
+		return null
+	}
 
-	await mkdir(join(state.runDir, 'requests'), { recursive: true })
-	await resetLatestFiles(state.latestDir)
+	try {
+		await mkdir(join(state.runDir, 'requests'), { recursive: true })
+		await resetLatestFiles(state.latestDir)
 
-	const session = redactSensitiveValue({
-		timestamp: new Date().toISOString(),
-		run_id: state.runId,
-		pid: process.pid,
-		cwd: process.cwd(),
-		listen_host: config.listenHost,
-		listen_port: config.listenPort,
-		backend: config.bridgeBackend,
-		...(config.bridgeBackend === 'codex'
-			? {
-					codex_command: config.codexCommand,
-					codex_auth_mode: config.codexAuthMode,
-					codex_auth_file: config.codexAuthFile,
-					codex_runtime_cwd: config.codexRuntimeCwd,
-				}
-			: {
-					ollama_base_url: config.ollamaBaseUrl,
-					ollama_model: config.ollamaModel,
-					ollama_request_timeout_ms: config.ollamaRequestTimeoutMs,
-				}),
-		capture_requests_path: config.captureRequestsPath,
-		capture_responses_path: config.captureResponsesPath,
-		root_dir: state.rootDir,
-		run_dir: state.runDir,
-		latest_dir: state.latestDir,
-	})
+		const session = redactSensitiveValue({
+			timestamp: new Date().toISOString(),
+			run_id: state.runId,
+			pid: process.pid,
+			cwd: process.cwd(),
+			listen_host: config.listenHost,
+			listen_port: config.listenPort,
+			backend: config.bridgeBackend,
+			...(config.bridgeBackend === 'codex'
+				? {
+						codex_command: config.codexCommand,
+						codex_auth_mode: config.codexAuthMode,
+						codex_auth_file: config.codexAuthFile,
+						codex_runtime_cwd: config.codexRuntimeCwd,
+					}
+				: {
+						ollama_base_url: config.ollamaBaseUrl,
+						ollama_model: config.ollamaModel,
+						ollama_request_timeout_ms: config.ollamaRequestTimeoutMs,
+					}),
+			capture_requests_path: config.captureRequestsPath,
+			capture_responses_path: config.captureResponsesPath,
+			root_dir: state.rootDir,
+			run_dir: state.runDir,
+			latest_dir: state.latestDir,
+		})
 
-	await writeFile(join(state.runDir, '00-session.json'), `${JSON.stringify(session, null, 2)}\n`, 'utf8')
-	await writeFile(join(state.latestDir, '00-session.json'), `${JSON.stringify(session, null, 2)}\n`, 'utf8')
-	await writeFile(join(state.rootDir, 'latest-run.txt'), `${state.runDir}\n`, 'utf8')
-	state.initialized = true
-	return state
+		await writeFile(join(state.runDir, '00-session.json'), `${JSON.stringify(session, null, 2)}\n`, 'utf8')
+		await writeFile(join(state.latestDir, '00-session.json'), `${JSON.stringify(session, null, 2)}\n`, 'utf8')
+		await writeFile(join(state.rootDir, 'latest-run.txt'), `${state.runDir}\n`, 'utf8')
+		state.initialized = true
+		return state
+	} catch (error) {
+		state.disabled = true
+		console.warn(
+			`[runtime-log] disabled: failed to initialize runtime log session at ${state.rootDir}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		)
+		return null
+	}
 }
 
 async function appendJsonLine(path: string, value: unknown) {
