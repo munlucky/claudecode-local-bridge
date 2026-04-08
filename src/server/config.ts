@@ -17,6 +17,8 @@ export interface RouterConfig {
 	serverIdleTimeoutSec: number
 	userAgent: string
 	logRequests: boolean
+	runtimeLogsEnabled: boolean
+	runtimeLogsRootPath: string
 	captureRequests: boolean
 	captureRequestsPath: string
 	captureResponses: boolean
@@ -25,6 +27,7 @@ export interface RouterConfig {
 	captureRetentionDays: number
 	heartbeatIntervalSec: number
 	modelAliases: Record<string, string>
+	ollamaModelAliases: Record<string, string>
 	ollamaBaseUrl: string
 	ollamaModel: string
 	ollamaApiKey: string | null
@@ -156,6 +159,28 @@ function parseModelAliases(): Record<string, string> {
 	return aliases
 }
 
+function parseOllamaModelAliases(): Record<string, string> {
+	const raw = trimToNull(process.env.OLLAMA_MODEL_ALIASES_JSON)
+	if (!raw) {
+		return {}
+	}
+
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>
+		const aliases: Record<string, string> = {}
+		for (const [key, value] of Object.entries(parsed)) {
+			if (typeof value === 'string' && value.trim()) {
+				aliases[key] = value.trim()
+			}
+		}
+		return aliases
+	} catch (error) {
+		throw new Error(
+			`OLLAMA_MODEL_ALIASES_JSON 파싱 실패: ${error instanceof Error ? error.message : String(error)}`,
+		)
+	}
+}
+
 export function loadConfig(): RouterConfig {
 	const apiTimeoutMs = parseTimeout(process.env.API_TIMEOUT_MS, 180000)
 	const codexOpenAiApiKey =
@@ -189,6 +214,10 @@ export function loadConfig(): RouterConfig {
 		),
 		userAgent: process.env.ROUTER_USER_AGENT?.trim() || 'claudecode-codex-local-bridge/2.0',
 		logRequests: parseBoolean(process.env.ROUTER_LOG_REQUESTS, true),
+		runtimeLogsEnabled: parseBoolean(process.env.ROUTER_RUNTIME_LOGS, true),
+		runtimeLogsRootPath: expandHomePath(
+			process.env.ROUTER_RUNTIME_LOGS_ROOT?.trim() || '.bridge-logs',
+		),
 		captureRequests: parseBoolean(process.env.ROUTER_CAPTURE_REQUESTS, true),
 		captureRequestsPath: expandHomePath(
 			process.env.ROUTER_CAPTURE_REQUESTS_PATH?.trim() ||
@@ -212,6 +241,7 @@ export function loadConfig(): RouterConfig {
 			30,
 		),
 		modelAliases: parseModelAliases(),
+		ollamaModelAliases: parseOllamaModelAliases(),
 		ollamaBaseUrl,
 		ollamaModel: trimToNull(process.env.OLLAMA_MODEL) || 'qwen3.5:27b',
 		ollamaApiKey,

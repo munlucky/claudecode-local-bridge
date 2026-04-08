@@ -50,10 +50,18 @@ export interface AnthropicMessage {
 	content: string | AnthropicInputContentBlock[]
 }
 
-export interface AnthropicThinkingConfig {
-	type: 'enabled'
-	budget_tokens: number
-}
+export type AnthropicThinkingConfig =
+	| {
+			type: 'enabled'
+			budget_tokens: number
+	  }
+	| {
+			type: 'disabled'
+	  }
+	| ({
+			type?: string
+			budget_tokens?: number
+	  } & JsonObject)
 
 export interface AnthropicToolDefinition {
 	name: string
@@ -220,8 +228,8 @@ export type BridgeBackend = 'codex' | 'ollama'
 export interface RouterHealthResponse {
 	status: 'ok'
 	backend: 'codex_app_server' | 'ollama_api'
-	auth_mode: 'api_key' | 'account' | 'local_auth_json' | 'disabled'
-	has_auth_mode_dependency: boolean
+	auth_mode?: 'api_key' | 'account' | 'local_auth_json' | 'disabled'
+	has_auth_mode_dependency?: boolean
 	live?: boolean
 	readiness?: 'ready' | 'degraded'
 	queue_depth?: number

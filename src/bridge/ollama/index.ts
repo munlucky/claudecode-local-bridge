@@ -3,11 +3,13 @@ import type {
 	AnthropicMessagesRequest,
 	AnthropicMessagesResponse,
 	AnthropicResponseContentBlock,
+	AnthropicToolDefinition,
 	AnthropicToolUseBlock,
 	JsonObject,
 } from '../../shared/index.js'
 import { AnthropicRequestValidationError } from '../anthropic/compat.js'
 import type { StreamLifecycleLoggerLike } from '../backend-provider.js'
+import { appendRuntimeLog } from '../../observability/runtime-log.js'
 
 type HeadersInit = Record<string, string> | string[][] | { [key: string]: string }
 
@@ -42,6 +44,52 @@ type OllamaRawToolCall = {
 	}
 }
 
+type OpenAIChatMessage = {
+	role?: string
+	content?: string
+	thinking?: string
+	tool_calls?: Array<{
+		index?: number
+		id?: string
+		type?: string
+		function?: {
+			name?: string
+			arguments?: JsonObject | string
+		}
+	}>
+}
+
+type OpenAIChatChoice = {
+	index?: number
+	message?: OpenAIChatMessage
+	delta?: OpenAIChatMessage
+	finish_reason?: string
+}
+
+type OpenAIChatResponse = {
+	id?: string
+	object?: string
+	model?: string
+	choices?: OpenAIChatChoice[]
+	usage?: {
+		prompt_tokens?: number
+		completion_tokens?: number
+		total_tokens?: number
+	}
+}
+
+type OllamaLikeResponse = OllamaRawResponse | OpenAIChatResponse
+
+type OpenAIToolCallAccumulatorEntry = {
+	key: string
+	id?: string
+	index?: number
+	functionName: string
+	argumentsText: string
+}
+
+type OllamaResponseShape = 'ollama' | 'openai'
+
 type OllamaRawMessage = {
 	role?: string
 	content?: string
@@ -59,6 +107,22 @@ type OllamaRawResponse = {
 	total_duration?: number
 	load_duration?: number
 	eval_duration?: number
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function getResponseShape(response: OllamaLikeResponse | unknown): OllamaResponseShape {
+	if (!isObject(response)) {
+		return 'ollama'
+	}
+
+	if (isOpenAIChatResponse(response)) {
+		return 'openai'
+	}
+
+	return 'ollama'
 }
 
 export type OllamaProviderModel = {
@@ -109,6 +173,81 @@ function buildHeaders(config: RouterConfig): HeadersInit {
 		headers.Authorization = `Bearer ${config.ollamaApiKey}`
 	}
 	return headers
+}
+
+function logOllamaRawSnapshot(
+	config: RouterConfig,
+	phase: 'non-stream' | 'stream',
+	payload: OllamaLikeResponse,
+	context?: {
+		routerRequestId?: string | null
+	},
+) {
+	const shape = getResponseShape(payload)
+	const content = extractContent(payload)
+	const thinking = extractThinking(payload)
+	const toolCalls = extractToolCalls(payload)
+	const usage = extractUsageCounts(payload)
+	const openAIChoices = isOpenAIChatResponse(payload) ? payload.choices ?? [] : []
+	const hasChoices = shape === 'openai'
+	const summary = {
+		shape,
+		top_level_keys: Object.keys(isObject(payload) ? payload : {}).sort(),
+		has_choices: hasChoices,
+		choices_count: hasChoices ? openAIChoices.length : 0,
+		phase,
+		router_request_id: context?.routerRequestId ?? null,
+		model: payload.model ?? null,
+		done: isOpenAIChatResponse(payload) ? null : payload.done ?? null,
+		done_reason: isOpenAIChatResponse(payload) ? null : payload.done_reason ?? null,
+		done_reason_openai:
+			shape === 'openai'
+				? (openAIChoices[0]?.finish_reason ?? null)
+				: null,
+		content_length: typeof content === 'string' ? content.length : null,
+		content_preview:
+			typeof content === 'string' && content.length > 0 ? content.slice(0, 160) : null,
+		thinking_length: typeof thinking === 'string' ? thinking.length : null,
+		thinking_preview:
+			typeof thinking === 'string' && thinking.length > 0 ? thinking.slice(0, 160) : null,
+		tool_call_count: toolCalls.length,
+		tool_call_names: toolCalls
+			.map((toolCall) => toolCall.function?.name ?? null)
+			.filter((name): name is string => Boolean(name)),
+		prompt_eval_count: usage.promptEvalCount,
+		eval_count: usage.evalCount,
+		total_tokens: usage.totalTokens,
+	}
+	process.stdout.write(`[ollama-raw] ${JSON.stringify(summary)}\n`)
+	void appendRuntimeLog(config, {
+		channel: '04-ollama-raw',
+		routerRequestId: context?.routerRequestId ?? null,
+		payload: summary as unknown as Record<string, unknown>,
+	})
+}
+
+function logOllamaRawLineIssue(
+	config: RouterConfig,
+	line: string,
+	reason: 'unsupported-sse-meta' | 'parse-failed',
+	context?: {
+		routerRequestId?: string | null
+	},
+) {
+	const summary = {
+		timestamp: new Date().toISOString(),
+		phase: 'stream-line',
+		reason,
+		router_request_id: context?.routerRequestId ?? null,
+		line_preview: line.slice(0, 240),
+		line_length: line.length,
+	}
+	process.stdout.write(`[ollama-raw-line] ${JSON.stringify(summary)}\n`)
+	void appendRuntimeLog(config, {
+		channel: '05-ollama-raw-lines',
+		routerRequestId: context?.routerRequestId ?? null,
+		payload: summary as unknown as Record<string, unknown>,
+	})
 }
 
 function parseModelFromArguments(raw: string | JsonObject | undefined): JsonObject {
@@ -163,8 +302,12 @@ function mapOllamaDoneReason(
 	doneReason: OllamaDoneReason | undefined,
 	hasToolCalls: boolean,
 ): OllamaStopReason {
+	if (hasToolCalls) {
+		return 'tool_use'
+	}
+
 	if (!doneReason) {
-		return hasToolCalls ? 'tool_use' : 'end_turn'
+		return 'end_turn'
 	}
 
 	switch (doneReason) {
@@ -173,14 +316,14 @@ function mapOllamaDoneReason(
 			return 'end_turn'
 		case 'tool_calls':
 		case 'tool_use':
-			return 'tool_use'
+			return 'end_turn'
 		case 'length':
 		case 'max_tokens':
 			return 'max_tokens'
 		case 'stop_sequence':
 			return 'stop_sequence'
 		default:
-			return hasToolCalls ? 'tool_use' : 'end_turn'
+			return 'end_turn'
 	}
 }
 
@@ -204,13 +347,16 @@ function mapAnthropicContentToText(content: unknown): string {
 				return typed.text
 			}
 
-			if (typed.type === 'tool_use' && typeof typed.name === 'string') {
-				const args = typeof typed.input === 'string' ? typed.input : JSON.stringify(typed.input ?? {})
-				return `[tool_use name=${typed.name} args=${args}]`
+			if (typed.type === 'tool_use') {
+				return ''
 			}
 
 			if (typed.type === 'tool_result' && typeof typed.tool_use_id === 'string') {
-				return `[tool_result id=${typed.tool_use_id}]`
+				const resultText = mapAnthropicContentToText(typed.content)
+				if (resultText.trim()) {
+					return `Tool result (${typed.tool_use_id}): ${resultText}`
+				}
+				return `Tool result (${typed.tool_use_id}).`
 			}
 
 			return ''
@@ -265,8 +411,16 @@ function resolveModel(config: RouterConfig, requestedModel: string): string {
 		return trimmed
 	}
 
-	const aliased = config.modelAliases[trimmed]
-	return aliased ?? config.ollamaModel
+	const aliased = config.ollamaModelAliases[trimmed]
+	if (aliased) {
+		return aliased
+	}
+
+	if (trimmed.startsWith('claude-')) {
+		return config.ollamaModel
+	}
+
+	return config.ollamaModel
 }
 
 export async function listOllamaModels(
@@ -339,6 +493,310 @@ function normalizeToolCalls(raw: OllamaRawToolCall[] | undefined): OllamaRawTool
 		}))
 }
 
+function getOpenAIChoice(payload: OpenAIChatResponse): OpenAIChatChoice | null {
+	if (!Array.isArray(payload.choices) || payload.choices.length === 0) {
+		return null
+	}
+
+	const first = payload.choices[0]
+	return first && typeof first === 'object' ? first : null
+}
+
+function getOpenAiChoicePayload(payload: OpenAIChatResponse): OpenAIChatMessage | null {
+	const choice = getOpenAIChoice(payload)
+	if (!choice) {
+		return null
+	}
+
+	const fromMessage = choice.message
+	if (fromMessage && typeof fromMessage === 'object') {
+		return fromMessage
+	}
+
+	const fromDelta = choice.delta
+	if (fromDelta && typeof fromDelta === 'object') {
+		return fromDelta
+	}
+
+	return null
+}
+
+function normalizeOpenAICalls(rawToolCalls?: OpenAIChatMessage['tool_calls']): OllamaRawToolCall[] {
+	if (!rawToolCalls?.length) {
+		return []
+	}
+
+	return rawToolCalls
+		.filter((toolCall) => {
+			const name =
+				toolCall?.function && typeof toolCall.function === 'object'
+					? toolCall.function.name
+					: undefined
+			return Boolean(typeof name === 'string' && name.trim())
+		})
+		.map((toolCall) => ({
+			id: toolCall?.id?.trim() || `call_${crypto.randomUUID()}`,
+			function: {
+				name: typeof toolCall?.function === 'object' ? toolCall.function?.name?.trim() : undefined,
+				arguments: parseModelFromArguments(
+					typeof toolCall?.function === 'object' ? toolCall.function?.arguments : undefined,
+				),
+				index: typeof toolCall?.index === 'number' ? toolCall.index : undefined,
+			},
+		}))
+}
+
+function buildOpenAIToolCallAccumulatorKey(
+	toolCall: NonNullable<OpenAIChatMessage['tool_calls']>[number],
+	position: number,
+): string {
+	if (typeof toolCall?.index === 'number') {
+		return `index:${toolCall.index}`
+	}
+
+	if (typeof toolCall?.id === 'string' && toolCall.id.trim()) {
+		return `id:${toolCall.id.trim()}`
+	}
+
+	return `position:${position}`
+}
+
+function accumulateOpenAIToolCalls(
+	accumulator: Map<string, OpenAIToolCallAccumulatorEntry>,
+	rawToolCalls?: OpenAIChatMessage['tool_calls'],
+) {
+	if (!rawToolCalls?.length) {
+		return
+	}
+
+	for (const [position, toolCall] of rawToolCalls.entries()) {
+		const key = buildOpenAIToolCallAccumulatorKey(toolCall, position)
+		const existing = accumulator.get(key) ?? {
+			key,
+			functionName: '',
+			argumentsText: '',
+		}
+
+		if (typeof toolCall?.id === 'string' && toolCall.id.trim()) {
+			existing.id = toolCall.id.trim()
+		}
+
+		if (typeof toolCall?.index === 'number') {
+			existing.index = toolCall.index
+		}
+
+		if (toolCall?.function && typeof toolCall.function === 'object') {
+			if (typeof toolCall.function.name === 'string' && toolCall.function.name.length > 0) {
+				existing.functionName += toolCall.function.name
+			}
+
+			if (typeof toolCall.function.arguments === 'string' && toolCall.function.arguments.length > 0) {
+				existing.argumentsText += toolCall.function.arguments
+			}
+
+			if (isObject(toolCall.function.arguments)) {
+				existing.argumentsText = JSON.stringify(toolCall.function.arguments)
+			}
+		}
+
+		accumulator.set(key, existing)
+	}
+}
+
+function finalizeAccumulatedOpenAIToolCalls(
+	accumulator: Map<string, OpenAIToolCallAccumulatorEntry>,
+): OllamaRawToolCall[] {
+	return Array.from(accumulator.values())
+		.sort((left, right) => {
+			const leftIndex = typeof left.index === 'number' ? left.index : Number.MAX_SAFE_INTEGER
+			const rightIndex = typeof right.index === 'number' ? right.index : Number.MAX_SAFE_INTEGER
+			return leftIndex - rightIndex
+		})
+		.map((entry) => ({
+			id: entry.id?.trim() || `call_${crypto.randomUUID()}`,
+			function: {
+				name: entry.functionName.trim() || undefined,
+				arguments: parseModelFromArguments(entry.argumentsText),
+				index: entry.index,
+			},
+		}))
+		.filter((toolCall) => Boolean(toolCall.function?.name))
+}
+
+function isOpenAIChatResponse(response: OllamaLikeResponse): response is OpenAIChatResponse {
+	if (!isObject(response)) {
+		return false
+	}
+
+	return Array.isArray((response as Record<string, unknown>).choices)
+}
+
+function extractContent(response: OllamaLikeResponse): string | undefined {
+	if (isOpenAIChatResponse(response)) {
+		const choicePayload = getOpenAiChoicePayload(response)
+		return choicePayload?.content
+	}
+
+	return response.message?.content
+}
+
+function extractThinking(response: OllamaLikeResponse): string | undefined {
+	if (isOpenAIChatResponse(response)) {
+		const choicePayload = getOpenAiChoicePayload(response)
+		return choicePayload?.thinking
+	}
+
+	return response.message?.thinking
+}
+
+function extractToolCalls(response: OllamaLikeResponse): OllamaRawToolCall[] {
+	if (isOpenAIChatResponse(response)) {
+		const choicePayload = getOpenAiChoicePayload(response)
+		return normalizeOpenAICalls(choicePayload?.tool_calls)
+	}
+
+	return normalizeToolCalls(response.message?.tool_calls)
+}
+
+function extractDoneReason(response: OllamaLikeResponse): string | undefined {
+	if (isOpenAIChatResponse(response)) {
+		const choice = getOpenAIChoice(response)
+		return choice?.finish_reason
+	}
+
+	return response.done_reason
+}
+
+function extractUsageCounts(response: OllamaLikeResponse) {
+	if (isOpenAIChatResponse(response)) {
+		return {
+			promptEvalCount:
+				typeof response.usage?.prompt_tokens === 'number' ? response.usage.prompt_tokens : null,
+			evalCount:
+				typeof response.usage?.completion_tokens === 'number' ? response.usage.completion_tokens : null,
+			totalTokens:
+				typeof response.usage?.total_tokens === 'number' ? response.usage.total_tokens : null,
+		}
+	}
+
+	return {
+		promptEvalCount: typeof response.prompt_eval_count === 'number' ? response.prompt_eval_count : null,
+		evalCount: typeof response.eval_count === 'number' ? response.eval_count : null,
+		totalTokens: null,
+	}
+}
+
+function buildAllowedToolMap(tools?: AnthropicToolDefinition[]): Map<string, AnthropicToolDefinition> {
+	return new Map(
+		(tools ?? [])
+			.filter((tool): tool is AnthropicToolDefinition => Boolean(tool?.name?.trim()))
+			.map((tool) => [tool.name, tool]),
+	)
+}
+
+function hasRequiredToolArguments(tool: AnthropicToolDefinition | undefined, input: JsonObject): boolean {
+	if (!tool || !isObject(tool.input_schema)) {
+		return true
+	}
+
+	const required = Array.isArray(tool.input_schema.required)
+		? tool.input_schema.required.filter((value): value is string => typeof value === 'string' && value.length > 0)
+		: []
+
+	if (required.length === 0) {
+		return true
+	}
+
+	const properties = isObject(tool.input_schema.properties) ? tool.input_schema.properties : {}
+	return required.every((field) => {
+		if (!(field in input)) {
+			return false
+		}
+
+		const value = input[field]
+		if (typeof value === 'string') {
+			return value.trim().length > 0
+		}
+
+			const propertySchema = properties[field]
+			if (isObject(propertySchema) && propertySchema.type === 'string') {
+				return false
+			}
+
+		return value !== undefined && value !== null
+	})
+}
+
+function parseBracketToolUseText(
+	content: string | undefined,
+	allowedTools?: Map<string, AnthropicToolDefinition>,
+): OllamaRawToolCall | null {
+	if (typeof content !== 'string') {
+		return null
+	}
+
+	const trimmed = content.trim()
+	const match = /^\[tool_use\s+name=([^\s\]]+)\s+args=([\s\S]*)\]$/.exec(trimmed)
+	if (!match) {
+		return null
+	}
+
+	const [, name, rawArgs] = match
+	if (!name || typeof rawArgs !== 'string') {
+		return null
+	}
+
+	if (allowedTools && allowedTools.size > 0 && !allowedTools.has(name)) {
+		return null
+	}
+
+	const parsedArguments = parseModelFromArguments(rawArgs)
+	if (!hasRequiredToolArguments(allowedTools?.get(name), parsedArguments)) {
+		return null
+	}
+
+	return {
+		id: `call_${crypto.randomUUID()}`,
+		function: {
+			name,
+			arguments: parsedArguments,
+		},
+	}
+}
+
+function filterToolCallsBySchema(
+	toolCalls: OllamaRawToolCall[],
+	allowedTools?: Map<string, AnthropicToolDefinition>,
+): OllamaRawToolCall[] {
+	if (!toolCalls.length) {
+		return []
+	}
+
+	return toolCalls.filter((toolCall) => {
+		const name = toolCall.function?.name?.trim()
+		if (!name) {
+			return false
+		}
+
+		if (allowedTools && allowedTools.size > 0 && !allowedTools.has(name)) {
+			return false
+		}
+
+		const parsedArguments = parseModelFromArguments(toolCall.function?.arguments)
+		return hasRequiredToolArguments(allowedTools?.get(name), parsedArguments)
+	})
+}
+
+function isPossibleBracketToolUsePrefix(content: string): boolean {
+	const trimmed = content.trimStart()
+	if (!trimmed) {
+		return false
+	}
+
+	const prefix = '[tool_use'
+	return prefix.startsWith(trimmed) || trimmed.startsWith(prefix)
+}
+
 export function mapToolCallsToAnthropicContent(
 	toolCalls?: OllamaRawToolCall[],
 ): AnthropicResponseContentBlock[] {
@@ -356,14 +814,17 @@ export function mapToolCallsToAnthropicContent(
 		} satisfies AnthropicToolUseBlock))
 }
 
-function mapOllamaUsageToAnthropic(response: OllamaRawResponse) {
-	const promptTokens = typeof response.prompt_eval_count === 'number' ? response.prompt_eval_count : 0
-	const completionTokens = typeof response.eval_count === 'number' ? response.eval_count : 0
+function mapOllamaUsageToAnthropic(response: OllamaLikeResponse) {
+	const counts = extractUsageCounts(response)
+	const promptTokens = counts.promptEvalCount ?? 0
+	const completionTokens = counts.evalCount ?? 0
+	const openAiTotal = counts.totalTokens
+	const fallbackTotal = counts.promptEvalCount && counts.evalCount ? counts.promptEvalCount + counts.evalCount : null
 
 	return {
 		input_tokens: promptTokens,
 		output_tokens: completionTokens,
-		total_tokens: promptTokens + completionTokens,
+		total_tokens: typeof openAiTotal === 'number' ? openAiTotal : (fallbackTotal ?? promptTokens + completionTokens),
 		cache_read_input_tokens: 0,
 		reasoning_output_tokens: 0,
 	}
@@ -371,7 +832,7 @@ function mapOllamaUsageToAnthropic(response: OllamaRawResponse) {
 
 function normalizeUsage(
 	previous: ReturnType<typeof mapOllamaUsageToAnthropic>,
-	next: OllamaRawResponse,
+	next: OllamaLikeResponse,
 ) {
 	const incoming = mapOllamaUsageToAnthropic(next)
 	return {
@@ -390,15 +851,24 @@ function normalizeUsage(
 }
 
 export function mapOllamaTurnToAnthropic(
-	response: OllamaRawResponse,
+	response: OllamaLikeResponse,
 	requestedModel: string,
+	tools?: AnthropicToolDefinition[],
 ): AnthropicMessagesResponse {
-	const contentText = response.message?.content ?? ''
-	const toolCalls = mapToolCallsToAnthropicContent(response.message?.tool_calls)
+	const contentText = extractContent(response)
+	const allowedTools = buildAllowedToolMap(tools)
+	const extractedToolCalls = filterToolCallsBySchema(extractToolCalls(response), allowedTools)
+	const fallbackTextToolCall =
+		extractedToolCalls.length === 0
+			? parseBracketToolUseText(contentText, allowedTools)
+			: null
+	const toolCalls = mapToolCallsToAnthropicContent(
+		fallbackTextToolCall ? [fallbackTextToolCall] : extractedToolCalls,
+	)
 	const usage = mapOllamaUsageToAnthropic(response)
 	const content: AnthropicResponseContentBlock[] = []
 
-	if (typeof contentText === 'string' && contentText.length > 0) {
+	if (!fallbackTextToolCall && typeof contentText === 'string' && contentText.length > 0) {
 		content.push({
 			type: 'text',
 			text: contentText,
@@ -416,7 +886,7 @@ export function mapOllamaTurnToAnthropic(
 		})
 	}
 
-	const stopReason = mapOllamaDoneReason(response.done_reason as OllamaDoneReason, toolCalls.length > 0)
+	const stopReason = mapOllamaDoneReason(extractDoneReason(response) as OllamaDoneReason, toolCalls.length > 0)
 
 	return {
 		id: `msg_${crypto.randomUUID()}`,
@@ -424,7 +894,7 @@ export function mapOllamaTurnToAnthropic(
 		role: 'assistant',
 		model: response.model ?? requestedModel,
 		content,
-		stop_reason: toolCalls.length > 0 ? 'tool_use' : stopReason,
+		stop_reason: stopReason,
 		stop_sequence: null,
 		usage,
 	}
@@ -461,13 +931,20 @@ export async function runOllamaTurn(
 			throw new Error(`/api/chat 호출 실패: ${response.status} ${response.statusText}`)
 		}
 
-		const body = (await response.json()) as OllamaRawResponse
+		const body = (await response.json()) as OllamaLikeResponse
 		if (typeof body !== 'object' || body === null) {
 			throw new Error('Ollama 응답 형식이 유효하지 않습니다.')
 		}
+		logOllamaRawSnapshot(config, 'non-stream', body, {
+			routerRequestId: context?.routerRequestId,
+		})
 
 		return {
-			response: mapOllamaTurnToAnthropic(body, request.model),
+			response: mapOllamaTurnToAnthropic(
+				body,
+				request.model,
+				request.tools,
+			),
 		}
 	} finally {
 		requestSignal.cleanup()
@@ -478,18 +955,48 @@ function formatSse(event: string, payload: unknown): Uint8Array {
 	return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
 }
 
-function parseStreamChunk(line: string): OllamaRawResponse | null {
+function parseStreamChunk(
+	config: RouterConfig,
+	line: string,
+	context?: {
+		routerRequestId?: string | null
+	},
+): OllamaLikeResponse | null {
 	const trimmed = line.trim()
 	if (!trimmed) {
 		return null
 	}
 
+	if (trimmed.startsWith('event:')) {
+		logOllamaRawLineIssue(config, trimmed, 'unsupported-sse-meta', context)
+		return null
+	}
+
+	const payload = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed
+	if (!payload) {
+		return null
+	}
+
+	if (payload === '[DONE]') {
+		return {
+			object: 'chat.completion.chunk',
+			choices: [
+				{
+					index: 0,
+					delta: {},
+					finish_reason: 'stop',
+				},
+			],
+		}
+	}
+
 	try {
-		const parsed = JSON.parse(trimmed) as unknown
+		const parsed = JSON.parse(payload) as unknown
 		return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-			? (parsed as OllamaRawResponse)
+			? (parsed as OllamaLikeResponse)
 			: null
 	} catch {
+		logOllamaRawLineIssue(config, payload, 'parse-failed', context)
 		return null
 	}
 }
@@ -625,7 +1132,6 @@ export function streamOllamaTurn(
 					)
 				}
 
-				messageText += delta
 				safeEnqueue(
 					formatSse('content_block_delta', {
 						type: 'content_block_delta',
@@ -656,7 +1162,7 @@ export function streamOllamaTurn(
 					return
 				}
 
-				const tools = buildToolBlocksFromRawToolCalls(dedupeToolCallsById(toolCalls))
+				const tools = buildToolBlocksFromRawToolCalls(getResolvedToolCalls())
 				for (const { index, block } of tools) {
 					const blockIndex = textStreamStarted ? index + 1 : index
 					safeEnqueue(
@@ -693,16 +1199,39 @@ export function streamOllamaTurn(
 			}
 
 			const finish = (finalReason: OllamaStopReason) => {
+				if (hasTools && toolCalls.length === 0 && pendingToolSyntaxText) {
+						const fallbackTextToolCall = parseBracketToolUseText(pendingToolSyntaxText, allowedTools)
+					if (fallbackTextToolCall) {
+						toolCalls.push(fallbackTextToolCall)
+						messageText = ''
+						pendingToolSyntaxText = ''
+					} else {
+						flushPendingToolSyntaxText()
+					}
+				}
+
 				flushTextStop()
 				if (hasTools) {
 					flushToolBlocks()
 				}
-				stopStream(finalReason, usage.output_tokens)
+				const finalToolCalls = getResolvedToolCalls()
+				const effectiveReason = finalToolCalls.length > 0 ? 'tool_use' : finalReason
+				const firstToolCall = finalToolCalls[0]
+				stopStream(effectiveReason, usage.output_tokens)
 				if (!isErrorState) {
 					void logger?.onComplete?.({
-						stopReason: finalReason,
+						stopReason: effectiveReason,
 						usage,
 						finalText: messageText,
+						decision:
+							firstToolCall
+								? {
+										kind: 'tool_use',
+										name: firstToolCall.function?.name,
+										input: parseModelFromArguments(firstToolCall.function?.arguments),
+										preamble: null,
+									}
+								: undefined,
 						metadata: {
 							model: resolvedModel,
 						},
@@ -720,8 +1249,103 @@ export function streamOllamaTurn(
 			let messageText = ''
 			let usage = mapOllamaUsageToAnthropic({})
 			const toolCalls: OllamaRawToolCall[] = []
+			const accumulatedOpenAIToolCalls = new Map<string, OpenAIToolCallAccumulatorEntry>()
+			const allowedTools = buildAllowedToolMap(request.tools)
+			let pendingToolSyntaxText = ''
+			let toolSyntaxProbeActive = hasTools
 			let didComplete = false
 			let isErrorState = false
+
+			const getResolvedToolCalls = () =>
+				dedupeToolCallsById([
+					...toolCalls,
+					...filterToolCallsBySchema(
+						finalizeAccumulatedOpenAIToolCalls(accumulatedOpenAIToolCalls),
+						allowedTools,
+					),
+				])
+
+			const flushPendingToolSyntaxText = () => {
+				if (!pendingToolSyntaxText) {
+					return
+				}
+
+				sendTextDelta(pendingToolSyntaxText)
+				pendingToolSyntaxText = ''
+				toolSyntaxProbeActive = false
+			}
+
+			const handleContentDelta = (delta: string) => {
+				if (!delta) {
+					return
+				}
+
+				messageText += delta
+				if (!hasTools || toolCalls.length > 0 || !toolSyntaxProbeActive) {
+					sendTextDelta(delta)
+					return
+				}
+
+				const nextCandidate = pendingToolSyntaxText + delta
+				const parsedToolCall = parseBracketToolUseText(nextCandidate, allowedTools)
+				if (parsedToolCall || isPossibleBracketToolUsePrefix(nextCandidate)) {
+					pendingToolSyntaxText = nextCandidate
+					return
+				}
+
+				sendTextDelta(nextCandidate)
+				pendingToolSyntaxText = ''
+				toolSyntaxProbeActive = false
+			}
+
+			const processParsedChunk = (parsed: OllamaLikeResponse) => {
+				logOllamaRawSnapshot(config, 'stream', parsed, {
+					routerRequestId: context?.routerRequestId,
+				})
+
+				resolvedModel = parsed.model || resolvedModel
+				usage = normalizeUsage(usage, parsed)
+
+				const content = extractContent(parsed) ?? ''
+				const thinking = extractThinking(parsed)
+				const choice = isOpenAIChatResponse(parsed) ? getOpenAIChoice(parsed) : null
+				const rawOpenAIDeltaToolCalls = choice?.delta?.tool_calls
+				const incomingToolCalls = rawOpenAIDeltaToolCalls?.length ? [] : extractToolCalls(parsed)
+
+				if (content) {
+					handleContentDelta(content)
+				}
+
+				if (
+					config.ollamaShowThinking &&
+					typeof thinking === 'string' &&
+					thinking
+				) {
+					flushPendingToolSyntaxText()
+					messageText += thinking
+					sendTextDelta(thinking)
+				}
+
+				if (incomingToolCalls.length > 0) {
+					flushPendingToolSyntaxText()
+					toolCalls.push(...filterToolCallsBySchema(incomingToolCalls, allowedTools))
+				}
+
+				if (rawOpenAIDeltaToolCalls?.length) {
+					flushPendingToolSyntaxText()
+					accumulateOpenAIToolCalls(accumulatedOpenAIToolCalls, rawOpenAIDeltaToolCalls)
+				}
+
+				const doneReason = extractDoneReason(parsed)
+				const done = !isOpenAIChatResponse(parsed) && parsed.done
+				if (done || doneReason) {
+					const finalReason = mapOllamaDoneReason(
+						doneReason as OllamaDoneReason,
+						getResolvedToolCalls().length > 0,
+					)
+					finish(finalReason)
+				}
+			}
 
 			void logger?.onSessionReady?.({ model: requestModel })
 
@@ -756,69 +1380,37 @@ export function streamOllamaTurn(
 					pendingChunk = lines.pop() ?? ''
 
 					for (const line of lines) {
-						const parsed = parseStreamChunk(line)
+						const parsed = parseStreamChunk(config, line, {
+							routerRequestId: context?.routerRequestId,
+						})
 						if (!parsed) {
 							continue
 						}
+						processParsedChunk(parsed)
+					}
 
-						resolvedModel = parsed.model || resolvedModel
-						usage = normalizeUsage(usage, parsed)
-
-						const content = parsed.message?.content ?? ''
-						if (content) {
-							sendTextDelta(content)
-						}
-						if (
-							config.ollamaShowThinking &&
-							typeof parsed.message?.thinking === 'string' &&
-							parsed.message.thinking
-						) {
-							sendTextDelta(parsed.message.thinking)
-						}
-
-						const incomingToolCalls = normalizeToolCalls(parsed.message?.tool_calls)
-						if (incomingToolCalls.length > 0) {
-							toolCalls.push(...incomingToolCalls)
-						}
-
-						if (parsed.done) {
-							const doneReason = mapOllamaDoneReason(parsed.done_reason as OllamaDoneReason, toolCalls.length > 0)
-							finish(doneReason)
-						}
+					const tailChunk = parseStreamChunk(config, pendingChunk, {
+						routerRequestId: context?.routerRequestId,
+					})
+					if (!didComplete && tailChunk) {
+						processParsedChunk(tailChunk)
+						pendingChunk = ''
 					}
 				}
 
-				const tailChunk = parseStreamChunk(pendingChunk)
-				if (!didComplete && tailChunk) {
-					resolvedModel = tailChunk.model || resolvedModel
-					usage = normalizeUsage(usage, tailChunk)
-					const content = tailChunk.message?.content ?? ''
-					if (content) {
-						sendTextDelta(content)
-					}
-					if (
-						config.ollamaShowThinking &&
-						typeof tailChunk.message?.thinking === 'string' &&
-						tailChunk.message.thinking
-					) {
-						sendTextDelta(tailChunk.message.thinking)
-					}
-					const tailToolCalls = normalizeToolCalls(tailChunk.message?.tool_calls)
-					if (tailToolCalls.length > 0) {
-						toolCalls.push(...tailToolCalls)
-					}
-					if (tailChunk.done) {
-						const doneReason = mapOllamaDoneReason(tailChunk.done_reason as OllamaDoneReason, toolCalls.length > 0)
-						finish(doneReason)
-					}
+				const finalChunk = parseStreamChunk(config, pendingChunk, {
+					routerRequestId: context?.routerRequestId,
+				})
+				if (!didComplete && finalChunk) {
+					processParsedChunk(finalChunk)
 				}
 
 				if (!didComplete) {
-					finish(mapOllamaDoneReason(undefined, toolCalls.length > 0))
+					finish(mapOllamaDoneReason(undefined, getResolvedToolCalls().length > 0))
 				}
 			} catch (error) {
-				isErrorState = true
-				didComplete = true
+					isErrorState = true
+					didComplete = true
 				if (isAbortError(error) || requestSignal.signal.aborted) {
 					void logger?.onCancel?.({})
 					void logger?.onError?.({

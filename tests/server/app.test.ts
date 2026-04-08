@@ -31,4 +31,21 @@ describe('requestSchema', () => {
 			type: 'disabled',
 		})
 	})
+
+	test('accepts passthrough thinking payload from newer claude clients', () => {
+		const parsed = requestSchema.parse({
+			model: 'claude-sonnet-4-5-20250929',
+			max_tokens: 128,
+			messages: [{ role: 'user', content: 'hello' }],
+			thinking: {
+				type: 'auto',
+				effort: 'medium',
+			},
+		})
+
+		expect(parsed.thinking).toEqual({
+			type: 'auto',
+			effort: 'medium',
+		})
+	})
 })

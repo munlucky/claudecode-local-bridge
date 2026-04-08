@@ -52,6 +52,8 @@ describe('loadConfig', () => {
 	})
 
 	test('enables request capture by default', () => {
+		delete process.env.ROUTER_RUNTIME_LOGS
+		delete process.env.ROUTER_RUNTIME_LOGS_ROOT
 		delete process.env.ROUTER_CAPTURE_REQUESTS
 		delete process.env.ROUTER_CAPTURE_REQUESTS_PATH
 		delete process.env.ROUTER_CAPTURE_RESPONSES
@@ -59,6 +61,8 @@ describe('loadConfig', () => {
 
 		const config = loadConfig()
 
+		expect(config.runtimeLogsEnabled).toBe(true)
+		expect(config.runtimeLogsRootPath.endsWith('.bridge-logs')).toBe(true)
 		expect(config.captureRequests).toBe(true)
 		expect(config.captureRequestsPath.endsWith('anthropic-requests.jsonl')).toBe(true)
 		expect(config.captureResponses).toBe(true)
@@ -102,6 +106,7 @@ describe('loadConfig', () => {
 			OLLAMA_MODEL: 'qwen3.5:27b',
 			OLLAMA_REQUEST_TIMEOUT_MS: '45000',
 			OLLAMA_SHOW_THINKING: '1',
+			OLLAMA_MODEL_ALIASES_JSON: '{"claude-sonnet-4-5-20250929":"qwen3.5:27b"}',
 		})
 
 		const config = loadConfig()
@@ -111,6 +116,7 @@ describe('loadConfig', () => {
 		expect(config.ollamaModel).toBe('qwen3.5:27b')
 		expect(config.ollamaRequestTimeoutMs).toBe(45000)
 		expect(config.ollamaShowThinking).toBe(true)
+		expect(config.ollamaModelAliases['claude-sonnet-4-5-20250929']).toBe('qwen3.5:27b')
 		restore()
 	})
 })

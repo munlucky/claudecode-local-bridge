@@ -120,6 +120,7 @@ tokens.json
 .claude
 .agents/
 .history/
+.bridge-logs/
 AGENTS.md
 
 # Local virtual environments
@@ -134,3 +135,4 @@ bun.lock
 docs
 workflow
 claude-code-main
+.bridge-qa

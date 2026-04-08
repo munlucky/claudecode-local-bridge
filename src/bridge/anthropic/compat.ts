@@ -35,6 +35,10 @@ export type ToolExecutionHint = {
 	status: 'resolved' | 'pending'
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
 const TOOL_MAPPING_RULES: ToolMappingRule[] = [
 	{
 		match: (name) =>
@@ -170,6 +174,39 @@ function summarizeJsonValue(value: unknown, limit = 280): string {
 				})()
 
 	return raw.length > limit ? `${raw.slice(0, limit - 3)}...` : raw
+}
+
+function normalizeInputSchemaToStrictObject(
+	toolName: string,
+	inputSchema: NonNullable<AnthropicMessagesRequest['tools']>[number]['input_schema'],
+): JsonObject {
+	if (!isPlainObject(inputSchema)) {
+		throw new AnthropicRequestValidationError(
+			`tool '${toolName}' input_schema 는 object 여야 합니다.`,
+			400,
+		)
+	}
+
+	if (inputSchema.type !== 'object') {
+		throw new AnthropicRequestValidationError(
+			`tool '${toolName}' input_schema.type 은 'object' 여야 합니다.`,
+			400,
+		)
+	}
+
+	return {
+		...inputSchema,
+		additionalProperties: false,
+	}
+}
+
+function normalizeToolDefinition(
+	tool: NonNullable<AnthropicMessagesRequest['tools']>[number],
+) {
+	return {
+		...tool,
+		input_schema: normalizeInputSchemaToStrictObject(tool.name, tool.input_schema),
+	}
 }
 
 function normalizeConversationSeedSegment(value: string): string {
@@ -311,12 +348,12 @@ function serializeBlocks(blocks: AnthropicInputContentBlock[]): string {
 				break
 			case 'tool_use':
 				lines.push(
-					`[tool_use id=${block.id} name=${block.name}] ${JSON.stringify(block.input ?? {})}`,
+					`Tool request ${block.name} (${block.id}): ${JSON.stringify(block.input ?? {})}`,
 				)
 				break
 			case 'tool_result':
 				lines.push(
-					`[tool_result tool_use_id=${block.tool_use_id}] ${
+					`Tool result for ${block.tool_use_id}: ${
 						typeof block.content === 'string'
 							? block.content
 							: JSON.stringify(block.content)
@@ -366,7 +403,7 @@ function formatToolDefinitions(request: AnthropicMessagesRequest): string {
 				{
 					name: tool.name,
 					description: tool.description ?? '',
-					input_schema: tool.input_schema,
+					input_schema: normalizeToolDefinition(tool).input_schema,
 				},
 				null,
 				2,
@@ -597,7 +634,7 @@ export function buildCodexPromptMetrics(
 		(request.tools ?? []).map((tool) => ({
 			name: tool.name,
 			description: tool.description ?? '',
-			input_schema: tool.input_schema,
+			input_schema: normalizeToolDefinition(tool).input_schema,
 		})),
 	)
 	const userVisibleText = [
@@ -864,7 +901,8 @@ export function validateAnthropicRequestSemantics(request: AnthropicMessagesRequ
 		if (!tool.name.trim()) {
 			throw new AnthropicRequestValidationError('tool.name 은 비어 있을 수 없습니다.', 400)
 		}
-		if (!isToolSchemaStrict(tool.input_schema)) {
+		const normalizedInputSchema = normalizeInputSchemaToStrictObject(tool.name, tool.input_schema)
+		if (!isToolSchemaStrict(normalizedInputSchema)) {
 			throw new AnthropicRequestValidationError(
 				`tool '${tool.name}' input_schema 는 strict object schema(type=object, additionalProperties=false)여야 합니다.`,
 				400,
