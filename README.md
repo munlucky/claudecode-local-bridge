@@ -1,29 +1,34 @@
 # claudecode-codex-local-bridge
 
-`codex app-server`와 로컬 Codex 인증 세션을 기반으로 동작하는 Claude Code용 Anthropic 호환 브리지입니다.
+Claude Code가 로컬 HTTP 엔드포인트를 통해 `codex app-server`, Ollama, optional `openai-compatible` provider로 라우팅할 수 있게 해주는 Anthropic 호환 브리지입니다.
 
-이 프로젝트는 Claude Code가 로컬 HTTP 엔드포인트를 통해 Codex와 통신할 수 있도록 Anthropic API의 일부를 얇게 변환해 주는 용도로 설계되었습니다. 멀티테넌트 운영이나 외부 공개 서비스용이 아니라 로컬 개발, 디버깅, 프로토콜 변환에 초점을 둡니다.
+이 프로젝트는 Anthropic Messages API의 일부를 로컬 브리지 표면으로 얇게 변환하고, 선택된 backend/provider에 맞는 요청/응답 형식으로 다시 매핑하는 용도로 설계되었습니다. 멀티테넌트 운영이나 외부 공개 서비스용이 아니라 로컬 개발, 디버깅, 프로토콜 변환에 초점을 둡니다.
 
 ## 제공 기능
 
 - `POST /v1/messages` 제공
 - `GET /v1/models` 제공
 - `GET /health` 제공
-- Anthropic Messages 요청을 Codex app-server turn으로 변환
-- Codex 응답을 Anthropic 호환 JSON 및 SSE 스트림으로 재구성
+- Anthropic Messages 요청을 Codex, Ollama, optional `openai-compatible` provider 요청으로 변환
+- provider 응답을 Anthropic 호환 JSON 및 SSE 스트림으로 재구성
 - Claude Code의 `tool_use` / `tool_result` 루프 유지
-- Anthropic 모델 ID를 Codex 모델로 매핑
+- Anthropic 모델 ID, provider-qualified model ID, routing alias를 backend/provider target으로 매핑
 - selector 기반 `provider/model` 라우팅 지원
 - optional `openai-compatible` provider slot 지원
 
 ## 요구 사항
 
 - [Bun](https://bun.sh/) `>= 1.1`
-- `PATH`에 등록된 `codex` 실행 파일
-- 인증 모드 설정(`CODEX_AUTH_MODE`)에 맞는 인증 준비
+- `BRIDGE_BACKEND=codex`를 사용할 경우 `PATH`에 등록된 `codex` 실행 파일
+- Codex backend 사용 시 인증 모드 설정(`CODEX_AUTH_MODE`)에 맞는 인증 준비
 - `local_auth_json` 모드: `~/.codex/auth.json` 또는 `CODEX_AUTH_FILE`에 유효한 인증 파일 필요
 - `account` 모드: `account/read` 계정 인증을 앱 서버가 자체 확인
 - `api_key` 모드: `CODEX_OPENAI_API_KEY` 또는 `OPENAI_API_KEY` 필요
+- `codex-direct` provider를 사용할 경우 `CODEX_DIRECT_ENABLED=1`과 선택한 direct auth 모드에 맞는 준비 필요
+- direct OAuth/auto 모드: `~/.codex/auth-direct.json` 또는 `CODEX_DIRECT_AUTH_STATE_FILE`에 direct auth state 필요
+- direct `api_key` 모드: `CODEX_OPENAI_API_KEY` 또는 `OPENAI_API_KEY` 필요
+- `BRIDGE_BACKEND=ollama`를 사용할 경우 접근 가능한 `OLLAMA_BASE_URL`과 모델
+- optional `openai-compatible` provider를 사용할 경우 `OPENAI_COMPATIBLE_BASE_URL`과 API 키
 
 ## 빠른 시작
 
@@ -62,6 +67,13 @@ bun run dev
 - `BRIDGE_BACKEND=codex` (기본): 기존 로컬 Codex 앱서버 사용
 - `BRIDGE_BACKEND=ollama`: Ollama API 기반 사용 (`/api/tags`, `/api/chat`)
 
+`codex-direct` rollout 기본값:
+
+- `CODEX_DIRECT_ENABLED=0` 기본: direct provider 비활성화, 기존 `codex-app-server` 경로 유지
+- `CODEX_DIRECT_ENABLED=1` + `CODEX_DIRECT_ROLLOUT=shadow`: `GET /v1/models`에 direct 모델을 provider-qualified ID로 함께 노출하지만 active path는 계속 `codex-app-server`
+- `CODEX_DIRECT_ENABLED=1` + `CODEX_DIRECT_ROLLOUT=prefer-direct`: active provider를 `codex-direct`로 전환
+- 1차 릴리스 기준 권장 posture는 `shadow` 이하이며, 기본 경로 변경 전에는 회귀 테스트와 rollback 절차를 먼저 확인해야 함
+
 추가 provider routing:
 
 - `provider/model` 형식(`ollama/qwen3.5:27b`, `openai-compatible/gpt-5.4-mini`)으로 명시 라우팅 가능
@@ -83,7 +95,7 @@ ANTHROPIC_AUTH_TOKEN=dummy
 ANTHROPIC_API_KEY=
 ```
 
-브리지는 inbound Anthropic 토큰을 검증하지 않고, 실제 upstream 인증은 로컬 Codex 세션으로 처리합니다.
+브리지는 inbound Anthropic 토큰을 검증하지 않습니다. 실제 upstream 인증은 active backend/provider 설정에 따라 Codex 세션, Ollama endpoint, 또는 `openai-compatible` API 키로 처리됩니다.
 반드시 `127.0.0.1` 또는 로컬 전용 인터페이스에만 바인딩해야 합니다.
 
 ### Ollama backend 사용 예시
@@ -121,6 +133,12 @@ node scripts/verify-ollama-bridge.mjs --base http://127.0.0.1:3000 --model qwen3
 | `CODEX_AUTH_MODE` | `local_auth_json` | 인증 모드 (`disabled`, `local_auth_json`, `account`, `api_key`) |
 | `CODEX_AUTH_FILE` | `~/.codex/auth.json` | 로컬 Codex 인증 파일 경로 |
 | `CODEX_OPENAI_API_KEY` | 미설정 | `api_key` 모드에서 직접 사용할 OpenAI API 키 |
+| `CODEX_DIRECT_ENABLED` | `0` | `codex-direct` provider 노출 여부 |
+| `CODEX_DIRECT_ROLLOUT` | `disabled` | `disabled`, `shadow`, `prefer-direct` |
+| `CODEX_DIRECT_AUTH_MODE` | `auto` | direct auth 모드 (`disabled`, `oauth`, `api_key`, `auto`) |
+| `CODEX_DIRECT_AUTH_STATE_FILE` | `~/.codex/auth-direct.json` | direct OAuth/auth state 파일 경로 |
+| `CODEX_DIRECT_BASE_URL` | ChatGPT Codex backend base | direct provider backend override (`.../backend-api/codex` or full `.../responses`) |
+| `CODEX_DIRECT_REQUEST_TIMEOUT_MS` | `180000` | direct provider request timeout(ms) |
 | `CODEX_RUNTIME_CWD` | `~/.codex/bridge-runtime` | Codex가 작업하는 기본 디렉터리 |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex 파일/쉘 권한 수준 |
 | `CODEX_TURN_TIMEOUT_MS` | `180000` | Codex 한 턴 최대 실행 시간 |
@@ -155,6 +173,17 @@ node scripts/verify-ollama-bridge.mjs --base http://127.0.0.1:3000 --model qwen3
   }
 }
 ```
+
+`codex-direct` shadow rollout 예시:
+
+```bash
+BRIDGE_BACKEND=codex
+CODEX_DIRECT_ENABLED=1
+CODEX_DIRECT_ROLLOUT=shadow
+CODEX_DIRECT_AUTH_MODE=auto
+```
+
+이 설정에서는 `/health`가 계속 `codex_app_server` readiness를 보여주고, `/v1/models`에는 `codex-direct/...` provider-qualified 모델이 추가로 노출됩니다. 실제 direct 경로 smoke는 `codex-direct/<model>` 또는 `prefer-direct` 전환 후에만 수행하세요.
 
 디버그 로그와 요청/응답 캡처는 기본적으로 활성화되어 있습니다. `.history/` 아래에 로컬 추적 파일을 남기고 싶지 않다면 다음 값을 끄면 됩니다.
 
@@ -243,6 +272,16 @@ Codex 추가 health 필드:
 - `queue_depth`, `active_session_count`, `pending_session_creates`: 세션 캐시와 대기 상태
 - `recent_retryable_failures`, `recent_non_retryable_failures`, `recent_retries`: 최근 브리지 실패/재시도 카운터
 
+`codex-direct`가 active provider인 경우 `/health`는 `backend: "codex_direct_api"`로 응답하며 다음 direct 전용 필드를 포함합니다.
+
+- `codex_direct_rollout`
+- `codex_direct_base_url`
+- `codex_direct_auth_state_file`
+- `has_codex_direct_auth_state`
+- `codex_direct_auth_state`
+
+Rollback이 필요하면 `CODEX_DIRECT_ROLLOUT=disabled` 또는 `shadow`로 되돌리고 `BRIDGE_BACKEND=codex` 기본 경로를 유지하면 됩니다.
+
 Ollama backend에서는 `ollama_base_url`, `ollama_model`, `has_ollama_api_key`, `live`, `readiness`만 반환합니다.
 
 `/health`는 위 항목이 `false`이면 503(서비스 점검)으로 반환됩니다.  
@@ -324,11 +363,19 @@ dist/
 
 운영/장애 대응 절차는 [docs/runbook.md](./docs/runbook.md)를 참고합니다.
 
+## 워크플로 문서
+
+- 운영/장애 대응: [docs/runbook.md](./docs/runbook.md)
+- PR 체크리스트: [workflow/PR_CHECKLIST.md](./workflow/PR_CHECKLIST.md)
+- 릴리스 절차: [workflow/RELEASE_PLAYBOOK.md](./workflow/RELEASE_PLAYBOOK.md)
+- 저장소 워크플로 개요: [workflow/README.md](./workflow/README.md)
+- 추가 검증 기준: [TEST_GUIDE.md](./TEST_GUIDE.md)
+
 ## 개발
 
 ```bash
 bun run typecheck
-bun test
+bun test tests
 bun run build
 ```
 
@@ -343,6 +390,8 @@ bun run build
 테스트는 `tests/` 아래에 모아 두었고, 프로덕션 코드는 `src/`에만 둡니다.
 
 추가 검증 기준은 [TEST_GUIDE.md](./TEST_GUIDE.md)를 참고하면 됩니다.
+
+`.claude/**`, workflow-core, verifier script를 바꾸는 작업은 [workflow/README.md](./workflow/README.md)와 `.claude/verification.contract.yaml`에 선언된 검증 명령을 함께 확인해야 합니다.
 
 ## 라이선스
 

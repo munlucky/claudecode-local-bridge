@@ -123,6 +123,8 @@ describe('loadConfig', () => {
 	test('parses provider routing policy override', () => {
 		const restore = withEnv({
 			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: undefined,
+			CODEX_DIRECT_ROLLOUT: undefined,
 			PROVIDER_ROUTING_JSON: JSON.stringify({
 				aliases: {
 					fast: 'ollama/qwen3.5:27b',
@@ -135,6 +137,7 @@ describe('loadConfig', () => {
 				},
 				providerDefaults: {
 					'codex-app-server': 'gpt-5.4',
+					'codex-direct': 'gpt-5.4-mini',
 					'ollama-chat': 'qwen3.5:27b',
 				},
 				fallback: 'ollama/qwen3.5:27b',
@@ -148,13 +151,56 @@ describe('loadConfig', () => {
 		expect(config.providerRouting.skillPolicies.review).toBe('ollama/qwen3.5:27b')
 		expect(config.providerRouting.familyPolicies.reasoning).toBe('ollama/qwen3.5:27b')
 		expect(config.providerRouting.providerDefaults['codex-app-server']).toBe('gpt-5.4')
+		expect(config.providerRouting.providerDefaults['codex-direct']).toBe('gpt-5.4-mini')
 		expect(config.providerRouting.fallback).toBe('ollama/qwen3.5:27b')
+		restore()
+	})
+
+	test('enables codex-direct rollout and auth config when requested', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'prefer-direct',
+			CODEX_DIRECT_AUTH_MODE: 'oauth',
+			CODEX_DIRECT_AUTH_STATE_FILE: '~/.codex/direct-auth.json',
+			CODEX_DIRECT_BASE_URL: 'https://api.openai.example',
+			CODEX_DIRECT_REQUEST_TIMEOUT_MS: '45000',
+		})
+
+		const config = loadConfig()
+
+		expect(config.activeProviderId).toBe('codex-direct')
+		expect(config.codexDirectEnabled).toBe(true)
+		expect(config.codexDirectRollout).toBe('prefer-direct')
+		expect(config.codexDirectAuthMode).toBe('oauth')
+		expect(config.codexDirectAuthStateFile.endsWith('.codex/direct-auth.json')).toBe(true)
+		expect(config.codexDirectBaseUrl).toBe('https://api.openai.example')
+		expect(config.codexDirectRequestTimeoutMs).toBe(45000)
+		restore()
+	})
+
+	test('keeps codex-app-server active until codex-direct rollout is explicitly prefer-direct', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: undefined,
+			PROVIDER_ROUTING_JSON: undefined,
+		})
+
+		const config = loadConfig()
+
+		expect(config.codexDirectEnabled).toBe(true)
+		expect(config.codexDirectRollout).toBe('disabled')
+		expect(config.activeProviderId).toBe('codex-app-server')
+		expect(config.providerRouting.fallback).toBe('codex-app-server/gpt-5.4')
 		restore()
 	})
 
 	test('parses openai-compatible env and leaves legacy backend default unchanged', () => {
 		const restore = withEnv({
 			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: undefined,
+			CODEX_DIRECT_ROLLOUT: undefined,
 			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
 			OPENAI_COMPATIBLE_API_KEY: 'test-key',
 			OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS: '45000',

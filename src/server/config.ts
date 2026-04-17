@@ -1,7 +1,14 @@
 import { resolve } from 'node:path'
 import { homedir } from 'node:os'
 
-export type ConfiguredProviderId = 'codex-app-server' | 'ollama-chat' | 'openai-compatible'
+export type ConfiguredProviderId =
+	| 'codex-app-server'
+	| 'codex-direct'
+	| 'ollama-chat'
+	| 'openai-compatible'
+
+export type CodexDirectAuthMode = 'disabled' | 'oauth' | 'api_key' | 'auto'
+export type CodexDirectRollout = 'disabled' | 'shadow' | 'prefer-direct'
 
 export interface ProviderRoutingPolicy {
 	aliases: Record<string, string>
@@ -15,11 +22,17 @@ export interface RouterConfig {
 	listenHost: string
 	listenPort: number
 	bridgeBackend: 'codex' | 'ollama'
-	activeProviderId: Extract<ConfiguredProviderId, 'codex-app-server' | 'ollama-chat'>
+	activeProviderId: Extract<ConfiguredProviderId, 'codex-app-server' | 'codex-direct' | 'ollama-chat'>
 	codexCommand: string
 	codexAuthMode: 'disabled' | 'local_auth_json' | 'account' | 'api_key'
 	codexAuthFile: string
 	codexOpenAiApiKey: string | null
+	codexDirectEnabled: boolean
+	codexDirectRollout: CodexDirectRollout
+	codexDirectAuthMode: CodexDirectAuthMode
+	codexDirectAuthStateFile: string
+	codexDirectBaseUrl: string | null
+	codexDirectRequestTimeoutMs: number
 	codexRuntimeCwd: string
 	codexSandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access'
 	codexInitTimeoutMs: number
@@ -146,6 +159,33 @@ function parseBridgeBackend(value: string | undefined): 'codex' | 'ollama' {
 	}
 }
 
+function parseCodexDirectAuthMode(value: string | undefined): CodexDirectAuthMode {
+	switch (value?.trim().toLowerCase()) {
+		case 'disabled':
+			return 'disabled'
+		case 'oauth':
+		case 'oauth_state':
+			return 'oauth'
+		case 'api_key':
+		case 'apikey':
+			return 'api_key'
+		default:
+			return 'auto'
+	}
+}
+
+function parseCodexDirectRollout(value: string | undefined): CodexDirectRollout {
+	switch (value?.trim().toLowerCase()) {
+		case 'prefer-direct':
+		case 'primary':
+			return 'prefer-direct'
+		case 'shadow':
+			return 'shadow'
+		default:
+			return 'disabled'
+	}
+}
+
 function parseModelAliases(): Record<string, string> {
 	const aliases: Record<string, string> = {
 		'claude-opus-4-1-20250805': process.env.CODEX_MODEL_OPUS?.trim() || 'gpt-5.4',
@@ -198,7 +238,13 @@ function parseOllamaModelAliases(): Record<string, string> {
 
 function getActiveProviderId(
 	bridgeBackend: 'codex' | 'ollama',
-): Extract<ConfiguredProviderId, 'codex-app-server' | 'ollama-chat'> {
+	codexDirectEnabled: boolean,
+	codexDirectRollout: CodexDirectRollout,
+): Extract<ConfiguredProviderId, 'codex-app-server' | 'codex-direct' | 'ollama-chat'> {
+	if (bridgeBackend === 'codex' && codexDirectEnabled && codexDirectRollout === 'prefer-direct') {
+		return 'codex-direct'
+	}
+
 	return bridgeBackend === 'ollama' ? 'ollama-chat' : 'codex-app-server'
 }
 
@@ -231,7 +277,12 @@ function parseProviderDefaults(
 
 	for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
 		if (
-			(key === 'codex-app-server' || key === 'ollama-chat' || key === 'openai-compatible') &&
+			(
+				key === 'codex-app-server' ||
+				key === 'codex-direct' ||
+				key === 'ollama-chat' ||
+				key === 'openai-compatible'
+			) &&
 			typeof value === 'string' &&
 			value.trim()
 		) {
@@ -244,12 +295,22 @@ function parseProviderDefaults(
 
 function parseProviderRouting(
 	bridgeBackend: 'codex' | 'ollama',
+	codexDirectEnabled: boolean,
+	codexDirectRollout: CodexDirectRollout,
 	modelAliases: Record<string, string>,
 	ollamaModel: string,
 ): ProviderRoutingPolicy {
-	const activeProviderId = getActiveProviderId(bridgeBackend)
+	const activeProviderId = getActiveProviderId(
+		bridgeBackend,
+		codexDirectEnabled,
+		codexDirectRollout,
+	)
 	const baseDefaults: Partial<Record<ConfiguredProviderId, string>> = {
 		'codex-app-server':
+			modelAliases['claude-sonnet-4-5-20250929'] ??
+			modelAliases['claude-opus-4-1-20250805'] ??
+			'gpt-5.4',
+		'codex-direct':
 			modelAliases['claude-sonnet-4-5-20250929'] ??
 			modelAliases['claude-opus-4-1-20250805'] ??
 			'gpt-5.4',
@@ -297,7 +358,9 @@ export function loadConfig(): RouterConfig {
 		trimToNull(process.env.CODEX_OPENAI_API_KEY) ?? trimToNull(process.env.OPENAI_API_KEY)
 	const codexTurnTimeoutMs = parseTimeout(process.env.CODEX_TURN_TIMEOUT_MS, apiTimeoutMs)
 	const bridgeBackend = parseBridgeBackend(process.env.BRIDGE_BACKEND)
-	const activeProviderId = getActiveProviderId(bridgeBackend)
+	const codexDirectEnabled = parseBoolean(process.env.CODEX_DIRECT_ENABLED, false)
+	const codexDirectRollout = parseCodexDirectRollout(process.env.CODEX_DIRECT_ROLLOUT)
+	const activeProviderId = getActiveProviderId(bridgeBackend, codexDirectEnabled, codexDirectRollout)
 	const modelAliases = parseModelAliases()
 	const ollamaModelAliases = parseOllamaModelAliases()
 	const ollamaBaseUrl = trimToNull(process.env.OLLAMA_BASE_URL) ?? 'http://127.0.0.1:11434'
@@ -317,6 +380,17 @@ export function loadConfig(): RouterConfig {
 		codexAuthMode: parseCodexAuthMode(process.env.CODEX_AUTH_MODE),
 		codexAuthFile: expandHomePath(process.env.CODEX_AUTH_FILE?.trim() || '~/.codex/auth.json'),
 		codexOpenAiApiKey,
+		codexDirectEnabled,
+		codexDirectRollout,
+		codexDirectAuthMode: parseCodexDirectAuthMode(process.env.CODEX_DIRECT_AUTH_MODE),
+		codexDirectAuthStateFile: expandHomePath(
+			process.env.CODEX_DIRECT_AUTH_STATE_FILE?.trim() || '~/.codex/auth-direct.json',
+		),
+		codexDirectBaseUrl: trimToNull(process.env.CODEX_DIRECT_BASE_URL),
+		codexDirectRequestTimeoutMs: parseTimeout(
+			process.env.CODEX_DIRECT_REQUEST_TIMEOUT_MS,
+			apiTimeoutMs,
+		),
 		codexRuntimeCwd: expandHomePath(
 			process.env.CODEX_RUNTIME_CWD?.trim() || '~/.codex/bridge-runtime',
 		),
@@ -372,6 +446,12 @@ export function loadConfig(): RouterConfig {
 			process.env.OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS,
 			120000,
 		),
-		providerRouting: parseProviderRouting(bridgeBackend, modelAliases, ollamaModel),
+		providerRouting: parseProviderRouting(
+			bridgeBackend,
+			codexDirectEnabled,
+			codexDirectRollout,
+			modelAliases,
+			ollamaModel,
+		),
 	}
 }

@@ -57,13 +57,28 @@ type StreamCompletePayload = {
 	}
 	metadata: {
 		model: string
+		messageId?: string | null
+		upstreamResponseId?: string | null
+		provisionalMessageId?: boolean
 	}
 }
 
 export type StreamLifecycleLoggerLike = StreamLifecycleLogger & {
 	onComplete?: (payload: StreamCompletePayload) => void | Promise<void>
-	onError?: (payload: { error: unknown; metadata?: { model?: string } }) => void | Promise<void>
-	onSessionReady?: (metadata: { model: string; threadId?: string }) => void | Promise<void>
+	onError?: (payload: {
+		error: unknown
+		metadata?: {
+			model?: string
+			upstreamResponseId?: string | null
+		}
+	}) => void | Promise<void>
+	onSessionReady?: (metadata: {
+		model: string
+		threadId?: string
+		messageId?: string | null
+		upstreamResponseId?: string | null
+		provisionalMessageId?: boolean
+	}) => void | Promise<void>
 }
 
 export type BackendModel = BackendModelEntry
@@ -187,7 +202,9 @@ export function createBackendProviderById(providerId: LegacyBackendId): BackendP
 }
 
 export function createBackendProvider(config: RouterConfig): BackendProvider {
-	return createBackendProviderById(config.activeProviderId)
+	return createBackendProviderById(
+		config.activeProviderId === 'codex-direct' ? 'codex-app-server' : config.activeProviderId,
+	)
 }
 
 export function getCodexBackendHealthSnapshot() {

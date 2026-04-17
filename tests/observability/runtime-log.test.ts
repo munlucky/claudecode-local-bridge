@@ -74,6 +74,7 @@ describe('runtime-log', () => {
 
 		expect(ollamaSession).toContain('"backend": "ollama"')
 		expect(ollamaSession).toContain('"ollama_base_url": "http://127.0.0.1:11434"')
+		expect(ollamaSession).toContain('"active_provider_id": "ollama-chat"')
 		expect(ollamaSession).not.toContain('"codex_auth_file"')
 		expect(ollamaSession).not.toContain('"codex_runtime_cwd"')
 
@@ -91,6 +92,65 @@ describe('runtime-log', () => {
 			delete process.env.OLLAMA_MODEL
 		} else {
 			process.env.OLLAMA_MODEL = restoreOllamaModel
+		}
+	})
+
+	test('records codex-direct rollout metadata in the session log when direct is active', async () => {
+		const restoreBackend = process.env.BRIDGE_BACKEND
+		const restoreDirectEnabled = process.env.CODEX_DIRECT_ENABLED
+		const restoreDirectRollout = process.env.CODEX_DIRECT_ROLLOUT
+		const restoreDirectAuthMode = process.env.CODEX_DIRECT_AUTH_MODE
+		const restoreDirectAuthStateFile = process.env.CODEX_DIRECT_AUTH_STATE_FILE
+		const restoreDirectBaseUrl = process.env.CODEX_DIRECT_BASE_URL
+
+		process.env.BRIDGE_BACKEND = 'codex'
+		process.env.CODEX_DIRECT_ENABLED = '1'
+		process.env.CODEX_DIRECT_ROLLOUT = 'prefer-direct'
+		process.env.CODEX_DIRECT_AUTH_MODE = 'oauth'
+		process.env.CODEX_DIRECT_AUTH_STATE_FILE = join(rootDir, 'auth-direct.json')
+		process.env.CODEX_DIRECT_BASE_URL = 'https://example.test/v1'
+
+		const config = loadConfig()
+		const info = getRuntimeLogInfo(config)
+		await ensureRuntimeLogSession(config)
+		const session = await readFile(join(info!.runDir, '00-session.json'), 'utf8')
+
+		expect(session).toContain('"backend": "codex"')
+		expect(session).toContain('"active_provider_id": "codex-direct"')
+		expect(session).toContain('"codex_direct_enabled": true')
+		expect(session).toContain('"codex_direct_rollout": "prefer-direct"')
+		expect(session).toContain('"codex_direct_auth_mode": "oauth"')
+		expect(session).toContain('"codex_direct_base_url": "https://example.test/v1"')
+
+		if (restoreBackend === undefined) {
+			delete process.env.BRIDGE_BACKEND
+		} else {
+			process.env.BRIDGE_BACKEND = restoreBackend
+		}
+		if (restoreDirectEnabled === undefined) {
+			delete process.env.CODEX_DIRECT_ENABLED
+		} else {
+			process.env.CODEX_DIRECT_ENABLED = restoreDirectEnabled
+		}
+		if (restoreDirectRollout === undefined) {
+			delete process.env.CODEX_DIRECT_ROLLOUT
+		} else {
+			process.env.CODEX_DIRECT_ROLLOUT = restoreDirectRollout
+		}
+		if (restoreDirectAuthMode === undefined) {
+			delete process.env.CODEX_DIRECT_AUTH_MODE
+		} else {
+			process.env.CODEX_DIRECT_AUTH_MODE = restoreDirectAuthMode
+		}
+		if (restoreDirectAuthStateFile === undefined) {
+			delete process.env.CODEX_DIRECT_AUTH_STATE_FILE
+		} else {
+			process.env.CODEX_DIRECT_AUTH_STATE_FILE = restoreDirectAuthStateFile
+		}
+		if (restoreDirectBaseUrl === undefined) {
+			delete process.env.CODEX_DIRECT_BASE_URL
+		} else {
+			process.env.CODEX_DIRECT_BASE_URL = restoreDirectBaseUrl
 		}
 	})
 

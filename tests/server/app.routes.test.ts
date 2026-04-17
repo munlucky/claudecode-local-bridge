@@ -1,57 +1,24 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { createApp } from '../../src/server/index.js'
-import { readFileSync } from 'node:fs'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
+import './app.routes.providers.test.js'
+import './app.routes.streaming.test.js'
+import {
+	createRouteTestHarness,
+	readJsonFixture,
+} from './app.routes.helpers.js'
 
-function readJsonFixture<T>(name: string): T {
-	return JSON.parse(readFileSync(join(process.cwd(), 'tests', 'fixtures', 'ollama', name), 'utf8')) as T
-}
-
-type MockFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
-
-function createMockReadableStream(lines: string[]): ReadableStream<Uint8Array> {
-	return new ReadableStream({
-		start(controller) {
-			controller.enqueue(new TextEncoder().encode(lines.join('\n')))
-			controller.close()
-		},
-	})
-}
+const {
+	createApp,
+	restoreEnv,
+	restoreFetch,
+	restoreOriginalFetch,
+} = createRouteTestHarness()
 
 describe('Ollama router integration', () => {
-	const originalFetch = global.fetch
-	const restoreEnv = (values: Record<string, string | undefined>) => {
-		const previous = Object.fromEntries(
-			Object.keys(values).map((key) => [key, process.env[key]]),
-		) as Record<string, string | undefined>
-
-		for (const [key, value] of Object.entries(values)) {
-			if (value === undefined) {
-				delete process.env[key]
-			} else {
-				process.env[key] = value
-			}
-		}
-
-		return () => {
-			for (const [key, value] of Object.entries(previous)) {
-				if (value === undefined) {
-					delete process.env[key]
-				} else {
-					process.env[key] = value
-				}
-			}
-		}
-	}
-
 	afterEach(() => {
-		global.fetch = originalFetch
+		restoreOriginalFetch()
 	})
-
-	const restoreFetch = (handler: MockFetch) => {
-		global.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
-			handler(input, init)) as typeof globalThis.fetch
-	}
 
 	test('returns ollama metadata in /health', async () => {
 		const restore = restoreEnv({
@@ -144,30 +111,29 @@ describe('Ollama router integration', () => {
 			})
 
 			const { app } = createApp()
-			const requestBody = {
-				model: 'qwen3.5:27b',
-				max_tokens: 256,
-				messages: [{ role: 'user', content: '서울 날씨 알려줘' }],
-			tools: [
-				{
-					name: 'get_weather',
-					description: 'Get current weather for a city',
-					input_schema: {
-						type: 'object',
-						additionalProperties: false,
-						properties: { city: { type: 'string' } },
-						required: ['city'],
-					},
-				},
-			],
-		}
 			const response = await app.fetch(
 				new Request('http://127.0.0.1:3000/v1/messages', {
 					method: 'POST',
 					headers: {
 						'content-type': 'application/json',
 					},
-					body: JSON.stringify(requestBody),
+					body: JSON.stringify({
+						model: 'qwen3.5:27b',
+						max_tokens: 256,
+						messages: [{ role: 'user', content: '서울 날씨 알려줘' }],
+						tools: [
+							{
+								name: 'get_weather',
+								description: 'Get current weather for a city',
+								input_schema: {
+									type: 'object',
+									additionalProperties: false,
+									properties: { city: { type: 'string' } },
+									required: ['city'],
+								},
+							},
+						],
+					}),
 				}),
 			)
 			const payload = (await response.json()) as {
@@ -306,9 +272,9 @@ describe('Ollama router integration', () => {
 		}
 	})
 
-		test('routes a prior skill flow through the configured skill policy', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
+	test('routes a prior skill flow through the configured skill policy', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
 			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
 			OLLAMA_MODEL: 'qwen3.5:27b',
 			PROVIDER_ROUTING_JSON: JSON.stringify({
@@ -387,94 +353,191 @@ describe('Ollama router integration', () => {
 			expect(response.status).toBe(200)
 			expect(payload.model).toBe('claude-sonnet-4-5-20250929')
 			expect(payload.content[0]?.type).toBe('text')
-			} finally {
-				restore()
-			}
+		} finally {
+			restore()
+		}
+	})
+
+	test('includes enabled openai-compatible models in /v1/models with provider-qualified ids', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
+			OPENAI_COMPATIBLE_API_KEY: 'test-key',
 		})
 
-		test('includes enabled openai-compatible models in /v1/models with provider-qualified ids', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
+		try {
+			restoreFetch(async (input) => {
+				if (String(input) === 'https://example.test/v1/models') {
+					return Response.json({
+						data: [{ id: 'gpt-5.4-mini' }],
+					})
+				}
+				throw new Error(`unexpected endpoint: ${String(input)}`)
 			})
 
-			try {
-				restoreFetch(async (input) => {
-					if (String(input) === 'https://example.test/v1/models') {
-						return Response.json({
-							data: [{ id: 'gpt-5.4-mini' }],
-						})
-					}
-					throw new Error(`unexpected endpoint: ${String(input)}`)
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
-				const payload = (await response.json()) as {
-					data: Array<{ id: string; name: string }>
-				}
-
-				expect(response.status).toBe(200)
-				expect(payload.data).toEqual(
-					expect.arrayContaining([
-						{
-							id: 'claude-sonnet-4-5-20250929',
-							name: 'claude-sonnet-4-5-20250929',
-							type: 'model',
-						},
-						{
-							id: 'openai-compatible/gpt-5.4-mini',
-							name: 'openai-compatible/gpt-5.4-mini',
-							type: 'model',
-						},
-					]),
-				)
-			} finally {
-				restore()
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
+			const payload = (await response.json()) as {
+				data: Array<{ id: string; name: string }>
 			}
+
+			expect(response.status).toBe(200)
+			expect(payload.data).toEqual(
+				expect.arrayContaining([
+					{
+						id: 'claude-sonnet-4-5-20250929',
+						name: 'claude-sonnet-4-5-20250929',
+						type: 'model',
+					},
+					{
+						id: 'openai-compatible/gpt-5.4-mini',
+						name: 'openai-compatible/gpt-5.4-mini',
+						type: 'model',
+					},
+				]),
+			)
+		} finally {
+			restore()
+		}
+	})
+
+	test('includes enabled codex-direct models in /v1/models with provider-qualified ids', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'shadow',
+			CODEX_DIRECT_AUTH_MODE: 'api_key',
+			CODEX_OPENAI_API_KEY: 'test-key',
 		})
 
-		test('prefixes non-active legacy provider models in /v1/models', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+		try {
+			restoreFetch(async () => {
+				throw new Error('codex-direct model listing should not call the upstream backend')
 			})
 
-			try {
-				restoreFetch(async (input) => {
-					if (String(input).includes('/api/tags')) {
-						return Response.json({
-							models: [{ model: 'qwen3.5:27b' }],
-						})
-					}
-					throw new Error(`unexpected endpoint: ${String(input)}`)
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
-				const payload = (await response.json()) as {
-					data: Array<{ id: string; name: string; type: string }>
-				}
-
-				expect(response.status).toBe(200)
-				expect(payload.data).toEqual(
-					expect.arrayContaining([
-						{
-							id: 'ollama/qwen3.5:27b',
-							name: 'ollama/qwen3.5:27b',
-							type: 'model',
-						},
-					]),
-				)
-			} finally {
-				restore()
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
+			const payload = (await response.json()) as {
+				data: Array<{ id: string; name: string }>
 			}
+
+			expect(response.status).toBe(200)
+			expect(payload.data).toEqual(
+				expect.arrayContaining([
+					{
+						id: 'codex-direct/claude-sonnet-4-5-20250929',
+						name: 'codex-direct/claude-sonnet-4-5-20250929',
+						type: 'model',
+					},
+				]),
+			)
+		} finally {
+			restore()
+		}
+	})
+
+	test('keeps /health on codex-app-server while codex-direct remains in shadow rollout', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'shadow',
+			CODEX_AUTH_MODE: 'disabled',
 		})
 
-		test('routes explicit openai-compatible model ids when configured', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
+		try {
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/health'))
+			const payload = (await response.json()) as {
+				backend: string
+				auth_mode: string
+				readiness: string
+				codex_direct_rollout?: string
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.backend).toBe('codex_app_server')
+			expect(payload.auth_mode).toBe('disabled')
+			expect(payload.readiness).toBe('ready')
+			expect(payload).not.toHaveProperty('codex_direct_rollout')
+		} finally {
+			restore()
+		}
+	})
+
+	test('returns codex-direct health metadata when prefer-direct rollout is active', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'prefer-direct',
+			CODEX_DIRECT_AUTH_MODE: 'api_key',
+			CODEX_OPENAI_API_KEY: 'test-key',
+			CODEX_DIRECT_BASE_URL: 'https://example.test/v1',
+		})
+
+		try {
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/health'))
+			const payload = (await response.json()) as {
+				backend: string
+				auth_mode: string
+				readiness: string
+				has_auth_mode_dependency: boolean
+				codex_direct_rollout: string
+				codex_direct_base_url: string | null
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.backend).toBe('codex_direct_api')
+			expect(payload.auth_mode).toBe('api_key')
+			expect(payload.readiness).toBe('ready')
+			expect(payload.has_auth_mode_dependency).toBe(true)
+			expect(payload.codex_direct_rollout).toBe('prefer-direct')
+			expect(payload.codex_direct_base_url).toBe('https://example.test/v1')
+		} finally {
+			restore()
+		}
+	})
+
+	test('prefixes non-active legacy provider models in /v1/models', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+		})
+
+		try {
+			restoreFetch(async (input) => {
+				if (String(input).includes('/api/tags')) {
+					return Response.json({
+						models: [{ model: 'qwen3.5:27b' }],
+					})
+				}
+				throw new Error(`unexpected endpoint: ${String(input)}`)
+			})
+
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
+			const payload = (await response.json()) as {
+				data: Array<{ id: string; name: string; type: string }>
+			}
+
+			expect(response.status).toBe(200)
+			expect(payload.data).toEqual(
+				expect.arrayContaining([
+					{
+						id: 'ollama/qwen3.5:27b',
+						name: 'ollama/qwen3.5:27b',
+						type: 'model',
+					},
+				]),
+			)
+		} finally {
+			restore()
+		}
+	})
+
+	test('routes explicit openai-compatible model ids when configured', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
 			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
 			OPENAI_COMPATIBLE_API_KEY: 'test-key',
 		})
@@ -528,314 +591,42 @@ describe('Ollama router integration', () => {
 				type: 'text',
 				text: 'openai-compatible 경로 응답입니다.',
 			})
-			} finally {
-				restore()
-			}
-		})
+		} finally {
+			restore()
+		}
+	})
 
-		test('preserves text and tool_result ordering when building openai-compatible request messages', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
-			})
-
-			try {
-				let capturedBody: Record<string, unknown> | null = null
-				restoreFetch(async (input, init) => {
-					if (String(input) === 'https://example.test/v1/chat/completions') {
-						capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
-						return Response.json({
-							id: 'chatcmpl-openai-compatible-ordered',
-							model: 'gpt-5.4-mini',
-							choices: [
-								{
-									finish_reason: 'stop',
-									message: {
-										content: 'ordered',
-									},
-								},
-							],
-							usage: {
-								prompt_tokens: 12,
-								completion_tokens: 4,
-								total_tokens: 16,
-							},
-						})
-					}
-					throw new Error(`unexpected endpoint: ${String(input)}`)
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							messages: [
-								{
-									role: 'assistant',
-									content: [
-										{
-											type: 'tool_use',
-											id: 'toolu_1',
-											name: 'Read',
-											input: { file_path: '/tmp/demo.txt' },
-										},
-									],
-								},
-								{
-									role: 'user',
-									content: [
-										{ type: 'text', text: 'before' },
-										{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'tool output' },
-										{ type: 'text', text: 'after' },
-									],
-								},
-							],
-							tools: [
-								{
-									name: 'Read',
-									description: 'Read a file',
-									input_schema: {
-										type: 'object',
-										properties: {
-											file_path: { type: 'string' },
-										},
-										required: ['file_path'],
-										additionalProperties: false,
-									},
-								},
-							],
-						}),
-					}),
-				)
-
-				expect(response.status).toBe(200)
-				expect(capturedBody?.messages).toEqual([
-					{
-						role: 'assistant',
-						content: null,
-						tool_calls: [
-							{
-								id: 'toolu_1',
-								type: 'function',
-								function: {
-									name: 'Read',
-									arguments: '{"file_path":"/tmp/demo.txt"}',
-								},
-							},
-						],
-					},
-					{
-						role: 'user',
-						content: 'before',
-					},
-					{
-						role: 'tool',
-						tool_call_id: 'toolu_1',
-						content: 'tool output',
-					},
-					{
-						role: 'user',
-						content: 'after',
-					},
-				])
-			} finally {
-				restore()
-			}
-		})
-
-		test('rejects Anthropic thinking on openai-compatible non-stream requests before upstream fetch', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
-			})
-
-			try {
-				restoreFetch(async () => {
-					throw new Error('upstream fetch should not run for unsupported thinking requests')
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							thinking: {
-								type: 'enabled',
-								budget_tokens: 64,
-							},
-							messages: [{ role: 'user', content: '짧게 답해줘' }],
-						}),
-					}),
-				)
-				const payload = (await response.json()) as {
-					error?: { message?: string }
-				}
-
-				expect(response.status).toBe(422)
-				expect(payload.error?.message).toContain(
-					"provider 'openai-compatible' does not support Anthropic thinking",
-				)
-			} finally {
-				restore()
-			}
-		})
-
-		test('rejects image content on openai-compatible non-stream requests before upstream fetch', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
-			})
-
-			try {
-				restoreFetch(async () => {
-					throw new Error('upstream fetch should not run for unsupported image requests')
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							messages: [
-								{
-									role: 'user',
-									content: [
-										{
-											type: 'image',
-											source: {
-												type: 'base64',
-												media_type: 'image/png',
-												data: 'aGVsbG8=',
-											},
-										},
-									],
-								},
-							],
-						}),
-					}),
-				)
-				const payload = (await response.json()) as {
-					error?: { message?: string }
-				}
-
-				expect(response.status).toBe(422)
-				expect(payload.error?.message).toContain(
-					"provider 'openai-compatible' does not support image content",
-				)
-			} finally {
-				restore()
-			}
-		})
-
-		test('includes upstream error previews for openai-compatible non-stream failures', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
-			})
-
-			try {
-				restoreFetch(async (input) => {
-					if (String(input) === 'https://example.test/v1/chat/completions') {
-						return Response.json(
-							{
-								error: {
-									message: 'provider rejected the request payload',
-								},
-							},
-							{
-								status: 400,
-								headers: {
-									'x-request-id': 'req_openai_compat_123',
-								},
-							},
-						)
-					}
-					throw new Error(`unexpected endpoint: ${String(input)}`)
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							messages: [{ role: 'user', content: '짧게 답해줘' }],
-						}),
-					}),
-				)
-				const payload = (await response.json()) as {
-					error?: { message?: string; raw_message?: string | null }
-				}
-
-				expect(response.status).toBe(502)
-				expect(payload.error?.message).toBe('failed to execute message')
-				expect(payload.error?.raw_message).toContain(
-					'openai-compatible request failed with status 400',
-				)
-				expect(payload.error?.raw_message).toContain(
-					'provider rejected the request payload',
-				)
-			} finally {
-				restore()
-			}
-		})
-
-		test('routes skill policy to openai-compatible without changing legacy defaults', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-			OPENAI_COMPATIBLE_API_KEY: 'test-key',
-			PROVIDER_ROUTING_JSON: JSON.stringify({
-				skillPolicies: {
-					review: 'openai-compatible/gpt-5.4-mini',
-				},
-			}),
+	test('routes explicit codex-direct model ids through the direct provider', async () => {
+		const restore = restoreEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'shadow',
+			CODEX_DIRECT_AUTH_MODE: 'api_key',
+			CODEX_OPENAI_API_KEY: 'test-key',
+			CODEX_DIRECT_BASE_URL: 'https://example.test/backend-api/codex',
 		})
 
 		try {
-			let callCount = 0
-			restoreFetch(async (input) => {
-				if (String(input) === 'https://example.test/v1/chat/completions') {
-					callCount += 1
+			let capturedHeaders: Headers | null = null
+			let capturedBody: Record<string, unknown> | null = null
+			restoreFetch(async (input, init) => {
+				if (String(input) === 'https://example.test/backend-api/codex/responses') {
+					capturedHeaders = new Headers(init?.headers)
+					capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
 					return Response.json({
-						id: 'chatcmpl-openai-compatible-2',
+						id: 'resp-codex-direct-1',
 						model: 'gpt-5.4-mini',
-						choices: [
+						output: [
 							{
-								finish_reason: 'stop',
-								message: {
-									content: 'skill policy가 openai-compatible로 라우팅되었습니다.',
-								},
+								type: 'message',
+								role: 'assistant',
+								content: [{ type: 'output_text', text: 'codex-direct 경로 응답입니다.' }],
 							},
 						],
 						usage: {
-							prompt_tokens: 9,
-							completion_tokens: 8,
-							total_tokens: 17,
+							input_tokens: 12,
+							output_tokens: 7,
+							total_tokens: 19,
 						},
 					})
 				}
@@ -850,41 +641,9 @@ describe('Ollama router integration', () => {
 						'content-type': 'application/json',
 					},
 					body: JSON.stringify({
-						model: 'claude-sonnet-4-5-20250929',
+						model: 'codex-direct/gpt-5.4-mini',
 						max_tokens: 128,
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-						messages: [
-							{
-								role: 'assistant',
-								content: [
-									{
-										type: 'tool_use',
-										id: 'toolu_skill_review',
-										name: 'Skill',
-										input: {
-											skill: 'review',
-										},
-									},
-								],
-							},
-							{
-								role: 'user',
-								content: '이어서 답해줘',
-							},
-						],
+						messages: [{ role: 'user', content: '짧게 답해줘' }],
 					}),
 				}),
 			)
@@ -894,697 +653,52 @@ describe('Ollama router integration', () => {
 			}
 
 			expect(response.status).toBe(200)
-			expect(callCount).toBe(1)
-			expect(payload.model).toBe('claude-sonnet-4-5-20250929')
-			expect(payload.content[0]?.text).toBe(
-				'skill policy가 openai-compatible로 라우팅되었습니다.',
-			)
-			} finally {
-				restore()
-			}
-		})
-
-		test('returns a controlled 502 when openai-compatible returns malformed tool arguments', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
+			expect(capturedHeaders?.get('authorization')).toBe('Bearer test-key')
+			expect(Array.isArray(capturedBody?.input)).toBe(true)
+			expect(payload.model).toBe('codex-direct/gpt-5.4-mini')
+			expect(payload.content[0]).toEqual({
+				type: 'text',
+				text: 'codex-direct 경로 응답입니다.',
 			})
-
-			try {
-				restoreFetch(async (input) => {
-					if (String(input) === 'https://example.test/v1/chat/completions') {
-						return Response.json({
-							id: 'chatcmpl-openai-compatible-bad-tool-args',
-							model: 'gpt-5.4-mini',
-							choices: [
-								{
-									finish_reason: 'tool_calls',
-									message: {
-										tool_calls: [
-											{
-												id: 'call_bad_args',
-												type: 'function',
-												function: {
-													name: 'Read',
-													arguments: '{"file_path":',
-												},
-											},
-										],
-									},
-								},
-							],
-						})
-					}
-					throw new Error(`unexpected endpoint: ${String(input)}`)
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							messages: [{ role: 'user', content: 'read this file' }],
-						}),
-					}),
-				)
-				const payload = (await response.json()) as {
-					error?: { message?: string; raw_message?: string | null }
-				}
-
-				expect(response.status).toBe(502)
-				expect(payload.error?.message).toBe('failed to execute message')
-				expect(payload.error?.raw_message).toContain('invalid JSON arguments')
-			} finally {
-				restore()
-			}
-		})
-
-		test('applies OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS to openai-compatible fetches', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-				OPENAI_COMPATIBLE_API_KEY: 'test-key',
-				OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS: '1000',
-			})
-
-			try {
-				restoreFetch(async (_input, init) => {
-					const signal = init?.signal
-					return await new Promise<Response>((_resolve, reject) => {
-						if (!(signal instanceof AbortSignal)) {
-							reject(new Error('missing abort signal'))
-							return
-						}
-						if (signal.aborted) {
-							reject(signal.reason)
-							return
-						}
-						signal.addEventListener(
-							'abort',
-							() => reject(signal.reason),
-							{ once: true },
-						)
-					})
-				})
-
-				const { app } = createApp()
-				const response = await app.fetch(
-					new Request('http://127.0.0.1:3000/v1/messages', {
-						method: 'POST',
-						headers: {
-							'content-type': 'application/json',
-						},
-						body: JSON.stringify({
-							model: 'openai-compatible/gpt-5.4-mini',
-							max_tokens: 128,
-							messages: [{ role: 'user', content: '짧게 답해줘' }],
-						}),
-					}),
-				)
-				const payload = (await response.json()) as {
-					error?: { message?: string; raw_message?: string | null }
-				}
-
-				expect(response.status).toBe(502)
-				expect(payload.error?.message).toBe('failed to execute message')
-				expect(payload.error?.raw_message).toContain('1000ms')
-			} finally {
-				restore()
-			}
-		})
-
-		test('returns a controlled 502 when openai-compatible streaming is requested', async () => {
-			const restore = restoreEnv({
-				BRIDGE_BACKEND: 'codex',
-			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
-			OPENAI_COMPATIBLE_API_KEY: 'test-key',
-		})
-
-		try {
-			restoreFetch(async () => {
-				throw new Error('stream setup should fail before any upstream fetch')
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'openai-compatible/gpt-5.4-mini',
-						max_tokens: 128,
-						stream: true,
-						messages: [{ role: 'user', content: '짧게 답해줘' }],
-					}),
-				}),
-			)
-			const payload = (await response.json()) as {
-				error?: { message?: string; raw_message?: string | null }
-			}
-
-			expect(response.status).toBe(502)
-			expect(payload.error?.message).toBe('failed to start stream')
-			expect(payload.error?.raw_message).toContain(
-				'openai-compatible streaming is not implemented yet',
-			)
 		} finally {
 			restore()
 		}
 	})
 
-	test('returns a provider routing error when the resolved provider is unavailable', async () => {
+	test('keeps prefer-direct health ready when oauth state is refreshable', async () => {
 		const restore = restoreEnv({
 			BRIDGE_BACKEND: 'codex',
-			PROVIDER_ROUTING_JSON: JSON.stringify({
-				aliases: {
-					fast: 'openai-compatible/gpt-5.4-mini',
-				},
-			}),
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'prefer-direct',
+			CODEX_DIRECT_AUTH_MODE: 'oauth',
+			CODEX_DIRECT_AUTH_STATE_FILE: join(process.cwd(), '.tmp-codex-direct-auth.json'),
 		})
 
 		try {
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'fast',
-						max_tokens: 128,
-						messages: [{ role: 'user', content: '짧게 답해줘' }],
-					}),
+			await Bun.write(
+				join(process.cwd(), '.tmp-codex-direct-auth.json'),
+				JSON.stringify({
+					authType: 'oauth',
+					accessToken: 'expired-token',
+					refreshToken: 'refresh-token',
+					expiresAt: '2000-01-01T00:00:00.000Z',
 				}),
 			)
+
+			const { app } = createApp()
+			const response = await app.fetch(new Request('http://127.0.0.1:3000/health'))
 			const payload = (await response.json()) as {
-				error?: { message?: string; raw_message?: string | null }
-			}
-
-			expect(response.status).toBe(502)
-			expect(payload.error?.message).toBe('failed to resolve provider route')
-			expect(payload.error?.raw_message).toContain("provider 'openai-compatible' is not available")
-		} finally {
-			restore()
-		}
-	})
-
-	test('does not re-route after a prior Skill tool_use already exists in the conversation', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-		})
-
-		try {
-			let providerCalls = 0
-			restoreFetch(async () => {
-				providerCalls += 1
-				return Response.json(readJsonFixture('08-openai-chat-response.json'))
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'claude-sonnet-4-6',
-						max_tokens: 256,
-						messages: [
-							{
-								role: 'assistant',
-								content: [
-									{
-										type: 'tool_use',
-										id: 'toolu_existing',
-										name: 'Skill',
-										input: {
-											skill: 'moonshot-phase-runner',
-											args: 'docs/implementation/00-master-plan-v1.md 개발 진행',
-										},
-									},
-								],
-							},
-							{
-								role: 'user',
-								content:
-									'Base directory for this skill: /tmp/skill\n\n# Moonshot Phase Runner\n\n## Usage\n/moonshot-phase-runner docs/implementation/00-master-plan-v1.md 개발 진행',
-							},
-						],
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-										args: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-					}),
-				}),
-			)
-			const payload = (await response.json()) as {
-				stop_reason: string
+				backend: string
+				readiness: string
+				codex_direct_auth_state: string
 			}
 
 			expect(response.status).toBe(200)
-			expect(payload.stop_reason).toBe('end_turn')
-			expect(providerCalls).toBe(1)
+			expect(payload.backend).toBe('codex_direct_api')
+			expect(payload.readiness).toBe('ready')
+			expect(payload.codex_direct_auth_state).toBe('refreshable')
 		} finally {
-			restore()
-		}
-	})
-
-	test('does not treat loaded skill body text as a fresh slash command', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-		})
-
-		try {
-			let providerCalls = 0
-			restoreFetch(async () => {
-				providerCalls += 1
-				return Response.json(readJsonFixture('08-openai-chat-response.json'))
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'claude-sonnet-4-6',
-						max_tokens: 256,
-						messages: [
-							{
-								role: 'user',
-								content:
-									'Base directory for this skill: /tmp/skill\n\n# Moonshot Phase Runner\n\n## Usage\n/moonshot-phase-runner [<plan-dir>] [--autonomous] [--execution-mode <mode>] [--prepare-only]',
-							},
-						],
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-										args: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-					}),
-				}),
-			)
-			const payload = (await response.json()) as {
-				stop_reason: string
-			}
-
-			expect(response.status).toBe(200)
-			expect(payload.stop_reason).toBe('end_turn')
-			expect(providerCalls).toBe(1)
-		} finally {
-			restore()
-		}
-	})
-
-	test('streams ollama events without thinking output', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-			OLLAMA_SHOW_THINKING: 'false',
-		})
-
-		try {
-			restoreFetch(async (input) => {
-				if (String(input).includes('/api/chat')) {
-					const chunkLines = [
-						'{"model":"qwen3.5:27b","message":{"content":"안녕하세요","thinking":"internal"},"done":false}',
-						'{"model":"qwen3.5:27b","message":{"content":"!","thinking":"next"},"done":true,"done_reason":"stop"}',
-					]
-					return new Response(createMockReadableStream(chunkLines), {
-						headers: {
-							'content-type': 'application/json',
-						},
-					})
-				}
-				throw new Error('unexpected endpoint')
-			})
-
-			const { app, config } = createApp()
-			const requestBody = {
-				model: 'qwen3.5:27b',
-				max_tokens: 128,
-				stream: true,
-				messages: [{ role: 'user', content: '인사말만' }],
-			}
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify(requestBody),
-				}),
-			)
-			const payload = await response.text()
-
-			expect(config.bridgeBackend).toBe('ollama')
-			expect(response.status).toBe(200)
-			expect(response.headers.get('content-type')).toContain('text/event-stream')
-			expect(payload).toContain('event: message_start')
-			expect(payload).toContain('event: content_block_start')
-			expect(payload).toContain('event: content_block_delta')
-			expect(payload).toContain('안녕하세요')
-			expect(payload).toContain('!')
-			expect(payload).toContain('event: message_delta')
-			expect(payload).toContain('event: message_stop')
-			expect(payload).not.toContain('internal')
-			expect(payload).not.toContain('next')
-		} finally {
-			restore()
-		}
-	})
-
-	test('streams explicit slash command as Skill tool_use without provider call', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-		})
-
-		try {
-			restoreFetch(async () => {
-				throw new Error('provider should not be called for direct skill routing')
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'claude-sonnet-4-6',
-						max_tokens: 256,
-						stream: true,
-						messages: [{ role: 'user', content: '/moonshot-phase-runner docs/implementation/ 개발 진행' }],
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-										args: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-					}),
-				}),
-			)
-			const payload = await response.text()
-
-			expect(response.status).toBe(200)
-			expect(payload).toContain('event: content_block_start')
-			expect(payload).toContain('"type":"tool_use"')
-			expect(payload).toContain('"name":"Skill"')
-			expect(payload).toContain('"skill":"moonshot-phase-runner"')
-			expect(payload).toContain('docs/implementation/ 개발 진행')
-			expect(payload).toContain('"stop_reason":"tool_use"')
-		} finally {
-			restore()
-		}
-	})
-
-	test('routes slash command embedded later in a user message to Skill tool', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-		})
-
-		try {
-			restoreFetch(async () => {
-				throw new Error('provider should not be called for embedded slash-command routing')
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'claude-sonnet-4-6',
-						max_tokens: 256,
-						messages: [
-							{
-								role: 'user',
-								content:
-									'<system-reminder>skill already loaded</system-reminder>\n/moonshot-phase-runner docs/implementation/00-master-plan-v1.md 개발 진행',
-							},
-						],
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-										args: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-					}),
-				}),
-			)
-			const payload = (await response.json()) as {
-				stop_reason: string
-				content: Array<{ type: string; name?: string; input?: Record<string, unknown> }>
-			}
-
-			expect(response.status).toBe(200)
-			expect(payload.stop_reason).toBe('tool_use')
-			expect(payload.content[0]).toMatchObject({
-				type: 'tool_use',
-				name: 'Skill',
-				input: {
-					skill: 'moonshot-phase-runner',
-					args: 'docs/implementation/00-master-plan-v1.md 개발 진행',
-				},
-			})
-		} finally {
-			restore()
-		}
-	})
-
-	test('routes command-name tag to Skill tool when slash line is absent', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-		})
-
-		try {
-			restoreFetch(async () => {
-				throw new Error('provider should not be called for command-name routing')
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'claude-sonnet-4-6',
-						max_tokens: 256,
-						messages: [
-							{
-								role: 'user',
-								content:
-									'<command-name>moonshot-phase-runner</command-name>\nMoonshot Phase Runner skill instructions...',
-							},
-						],
-						tools: [
-							{
-								name: 'Skill',
-								description: 'Execute a skill',
-								input_schema: {
-									type: 'object',
-									properties: {
-										skill: { type: 'string' },
-										args: { type: 'string' },
-									},
-									required: ['skill'],
-									additionalProperties: false,
-								},
-							},
-						],
-					}),
-				}),
-			)
-			const payload = (await response.json()) as {
-				stop_reason: string
-				content: Array<{ type: string; name?: string; input?: Record<string, unknown> }>
-			}
-
-			expect(response.status).toBe(200)
-			expect(payload.stop_reason).toBe('tool_use')
-			expect(payload.content[0]).toMatchObject({
-				type: 'tool_use',
-				name: 'Skill',
-				input: {
-					skill: 'moonshot-phase-runner',
-				},
-			})
-		} finally {
-			restore()
-		}
-	})
-
-	test('streams SSE-wrapped OpenAI events via ollama route', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-			OLLAMA_SHOW_THINKING: 'false',
-		})
-
-		try {
-			restoreFetch(async (input) => {
-				if (String(input).includes('/api/chat')) {
-					const chunkLines = [
-						'event: message',
-						'data: {"id":"chatcmpl-04","object":"chat.completion.chunk","created":1770000004,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":"하나"},"finish_reason":null}]}',
-						'',
-						'data: {"id":"chatcmpl-04","object":"chat.completion.chunk","created":1770000004,"model":"qwen3.5:27b","choices":[{"index":0,"delta":{"content":" 둘"},"finish_reason":"stop"}]}',
-						'',
-						'data: [DONE]',
-					]
-					return new Response(createMockReadableStream(chunkLines), {
-						headers: {
-							'content-type': 'text/event-stream',
-						},
-					})
-				}
-				throw new Error('unexpected endpoint')
-			})
-
-			const { app, config } = createApp()
-			const requestBody = {
-				model: 'qwen3.5:27b',
-				max_tokens: 128,
-				stream: true,
-				messages: [{ role: 'user', content: '두 단어만' }],
-			}
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify(requestBody),
-				}),
-			)
-			const payload = await response.text()
-
-			expect(config.bridgeBackend).toBe('ollama')
-			expect(response.status).toBe(200)
-			expect(response.headers.get('content-type')).toContain('text/event-stream')
-			expect(payload).toContain('event: content_block_start')
-			expect(payload).toContain('하나')
-			expect(payload).toContain(' 둘')
-			expect(payload).toContain('event: message_delta')
-			expect(payload).toContain('event: message_stop')
-		} finally {
-			restore()
-		}
-	})
-
-	test('keeps exposed model id in streamed message_start when provider-qualified routing is used', async () => {
-		const restore = restoreEnv({
-			BRIDGE_BACKEND: 'ollama',
-			OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
-			OLLAMA_MODEL: 'qwen3.5:27b',
-			OLLAMA_SHOW_THINKING: 'false',
-		})
-
-		try {
-			restoreFetch(async (input) => {
-				if (String(input).includes('/api/chat')) {
-					const chunkLines = [
-						'{"model":"qwen3.5:27b","message":{"content":"안녕하세요"},"done":false}',
-						'{"model":"qwen3.5:27b","message":{"content":"!"},"done":true,"done_reason":"stop"}',
-					]
-					return new Response(createMockReadableStream(chunkLines), {
-						headers: {
-							'content-type': 'application/json',
-						},
-					})
-				}
-				throw new Error('unexpected endpoint')
-			})
-
-			const { app } = createApp()
-			const response = await app.fetch(
-				new Request('http://127.0.0.1:3000/v1/messages', {
-					method: 'POST',
-					headers: {
-						'content-type': 'application/json',
-					},
-					body: JSON.stringify({
-						model: 'ollama/qwen3.5:27b',
-						max_tokens: 128,
-						stream: true,
-						messages: [{ role: 'user', content: '인사말만' }],
-					}),
-				}),
-			)
-			const payload = await response.text()
-
-			expect(response.status).toBe(200)
-			expect(payload).toContain('"model":"ollama/qwen3.5:27b"')
-			expect(payload).not.toContain('"model":"qwen3.5:27b","content"')
-		} finally {
+			rmSync(join(process.cwd(), '.tmp-codex-direct-auth.json'), { force: true })
 			restore()
 		}
 	})

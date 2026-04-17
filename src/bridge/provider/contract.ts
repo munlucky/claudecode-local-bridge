@@ -18,7 +18,13 @@ export interface ProviderExecutionContext {
 }
 
 export interface ProviderStreamObserver {
-	onSessionReady?: (metadata: { model: string; threadId?: string }) => void | Promise<void>
+	onSessionReady?: (metadata: {
+		model: string
+		threadId?: string
+		messageId?: string | null
+		upstreamResponseId?: string | null
+		provisionalMessageId?: boolean
+	}) => void | Promise<void>
 	onComplete?: (payload: {
 		stopReason: CanonicalStopReason
 		usage: CanonicalUsage
@@ -32,9 +38,18 @@ export interface ProviderStreamObserver {
 		}
 		metadata: {
 			model: string
+			messageId?: string | null
+			upstreamResponseId?: string | null
+			provisionalMessageId?: boolean
 		}
 	}) => void | Promise<void>
-	onError?: (payload: { error: unknown; metadata?: { model?: string } }) => void | Promise<void>
+	onError?: (payload: {
+		error: unknown
+		metadata?: {
+			model?: string
+			upstreamResponseId?: string | null
+		}
+	}) => void | Promise<void>
 	onCancel?: () => void | Promise<void>
 	onEvent?: (event: CanonicalStreamEvent) => void | Promise<void>
 }
@@ -42,7 +57,11 @@ export interface ProviderStreamObserver {
 export interface BridgeProviderAdapter {
 	providerId: CanonicalProviderId
 	legacyBackend: 'codex' | 'ollama' | 'openai-compatible'
-	healthBackend: 'codex_app_server' | 'ollama_api' | 'openai_compatible_api'
+	healthBackend:
+		| 'codex_app_server'
+		| 'codex_direct_api'
+		| 'ollama_api'
+		| 'openai_compatible_api'
 	listModels(
 		config: RouterConfig,
 		abortSignal?: AbortSignal | null,
