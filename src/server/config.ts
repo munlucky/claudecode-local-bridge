@@ -1,10 +1,21 @@
 import { resolve } from 'node:path'
 import { homedir } from 'node:os'
 
+export type ConfiguredProviderId = 'codex-app-server' | 'ollama-chat' | 'openai-compatible'
+
+export interface ProviderRoutingPolicy {
+	aliases: Record<string, string>
+	skillPolicies: Record<string, string>
+	familyPolicies: Record<string, string>
+	providerDefaults: Partial<Record<ConfiguredProviderId, string>>
+	fallback: string
+}
+
 export interface RouterConfig {
 	listenHost: string
 	listenPort: number
 	bridgeBackend: 'codex' | 'ollama'
+	activeProviderId: Extract<ConfiguredProviderId, 'codex-app-server' | 'ollama-chat'>
 	codexCommand: string
 	codexAuthMode: 'disabled' | 'local_auth_json' | 'account' | 'api_key'
 	codexAuthFile: string
@@ -33,6 +44,10 @@ export interface RouterConfig {
 	ollamaApiKey: string | null
 	ollamaRequestTimeoutMs: number
 	ollamaShowThinking: boolean
+	openAiCompatibleBaseUrl: string | null
+	openAiCompatibleApiKey: string | null
+	openAiCompatibleRequestTimeoutMs: number
+	providerRouting: ProviderRoutingPolicy
 }
 
 function trimToNull(value: string | undefined): string | null {
@@ -181,19 +196,123 @@ function parseOllamaModelAliases(): Record<string, string> {
 	}
 }
 
+function getActiveProviderId(
+	bridgeBackend: 'codex' | 'ollama',
+): Extract<ConfiguredProviderId, 'codex-app-server' | 'ollama-chat'> {
+	return bridgeBackend === 'ollama' ? 'ollama-chat' : 'codex-app-server'
+}
+
+function mergeStringRecord(
+	base: Record<string, string>,
+	incoming: unknown,
+): Record<string, string> {
+	const next = { ...base }
+	if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+		return next
+	}
+
+	for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
+		if (typeof value === 'string' && value.trim()) {
+			next[key] = value.trim()
+		}
+	}
+
+	return next
+}
+
+function parseProviderDefaults(
+	base: Partial<Record<ConfiguredProviderId, string>>,
+	incoming: unknown,
+): Partial<Record<ConfiguredProviderId, string>> {
+	const next = { ...base }
+	if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+		return next
+	}
+
+	for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
+		if (
+			(key === 'codex-app-server' || key === 'ollama-chat' || key === 'openai-compatible') &&
+			typeof value === 'string' &&
+			value.trim()
+		) {
+			next[key] = value.trim()
+		}
+	}
+
+	return next
+}
+
+function parseProviderRouting(
+	bridgeBackend: 'codex' | 'ollama',
+	modelAliases: Record<string, string>,
+	ollamaModel: string,
+): ProviderRoutingPolicy {
+	const activeProviderId = getActiveProviderId(bridgeBackend)
+	const baseDefaults: Partial<Record<ConfiguredProviderId, string>> = {
+		'codex-app-server':
+			modelAliases['claude-sonnet-4-5-20250929'] ??
+			modelAliases['claude-opus-4-1-20250805'] ??
+			'gpt-5.4',
+		'ollama-chat': ollamaModel,
+	}
+
+	const basePolicy: ProviderRoutingPolicy = {
+		aliases: {},
+		skillPolicies: {},
+		familyPolicies: {},
+		providerDefaults: baseDefaults,
+		fallback: `${activeProviderId}/${baseDefaults[activeProviderId] ?? (activeProviderId === 'ollama-chat' ? ollamaModel : 'gpt-5.4')}`,
+	}
+
+	const raw = trimToNull(process.env.PROVIDER_ROUTING_JSON)
+	if (!raw) {
+		return basePolicy
+	}
+
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>
+		const providerDefaults = parseProviderDefaults(basePolicy.providerDefaults, parsed.providerDefaults)
+		const fallback =
+			typeof parsed.fallback === 'string' && parsed.fallback.trim()
+				? parsed.fallback.trim()
+				: basePolicy.fallback
+
+		return {
+			aliases: mergeStringRecord(basePolicy.aliases, parsed.aliases),
+			skillPolicies: mergeStringRecord(basePolicy.skillPolicies, parsed.skillPolicies),
+			familyPolicies: mergeStringRecord(basePolicy.familyPolicies, parsed.familyPolicies),
+			providerDefaults,
+			fallback,
+		}
+	} catch (error) {
+		throw new Error(
+			`PROVIDER_ROUTING_JSON 파싱 실패: ${error instanceof Error ? error.message : String(error)}`,
+		)
+	}
+}
+
 export function loadConfig(): RouterConfig {
 	const apiTimeoutMs = parseTimeout(process.env.API_TIMEOUT_MS, 180000)
 	const codexOpenAiApiKey =
 		trimToNull(process.env.CODEX_OPENAI_API_KEY) ?? trimToNull(process.env.OPENAI_API_KEY)
 	const codexTurnTimeoutMs = parseTimeout(process.env.CODEX_TURN_TIMEOUT_MS, apiTimeoutMs)
 	const bridgeBackend = parseBridgeBackend(process.env.BRIDGE_BACKEND)
+	const activeProviderId = getActiveProviderId(bridgeBackend)
+	const modelAliases = parseModelAliases()
+	const ollamaModelAliases = parseOllamaModelAliases()
 	const ollamaBaseUrl = trimToNull(process.env.OLLAMA_BASE_URL) ?? 'http://127.0.0.1:11434'
+	const ollamaModel = trimToNull(process.env.OLLAMA_MODEL) || 'qwen3.5:27b'
 	const ollamaApiKey = trimToNull(process.env.OLLAMA_API_KEY)
+	const openAiCompatibleBaseUrl = trimToNull(process.env.OPENAI_COMPATIBLE_BASE_URL)
+	const openAiCompatibleApiKey =
+		trimToNull(process.env.OPENAI_COMPATIBLE_API_KEY) ??
+		trimToNull(process.env.OPENAI_API_KEY)
 
 	return {
 		listenHost: process.env.ROUTER_LISTEN_HOST?.trim() || '127.0.0.1',
 		listenPort: parsePort(process.env.ROUTER_LISTEN_PORT, 3000),
 		bridgeBackend,
+		activeProviderId,
 		codexCommand: process.env.CODEX_COMMAND?.trim() || 'codex',
 		codexAuthMode: parseCodexAuthMode(process.env.CODEX_AUTH_MODE),
 		codexAuthFile: expandHomePath(process.env.CODEX_AUTH_FILE?.trim() || '~/.codex/auth.json'),
@@ -240,12 +359,19 @@ export function loadConfig(): RouterConfig {
 			process.env.ROUTER_HEARTBEAT_INTERVAL_SEC,
 			30,
 		),
-		modelAliases: parseModelAliases(),
-		ollamaModelAliases: parseOllamaModelAliases(),
+		modelAliases,
+		ollamaModelAliases,
 		ollamaBaseUrl,
-		ollamaModel: trimToNull(process.env.OLLAMA_MODEL) || 'qwen3.5:27b',
+		ollamaModel,
 		ollamaApiKey,
 		ollamaRequestTimeoutMs: parseTimeout(process.env.OLLAMA_REQUEST_TIMEOUT_MS, 120000),
 		ollamaShowThinking: parseBoolean(process.env.OLLAMA_SHOW_THINKING, false),
+		openAiCompatibleBaseUrl,
+		openAiCompatibleApiKey,
+		openAiCompatibleRequestTimeoutMs: parseTimeout(
+			process.env.OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS,
+			120000,
+		),
+		providerRouting: parseProviderRouting(bridgeBackend, modelAliases, ollamaModel),
 	}
 }
