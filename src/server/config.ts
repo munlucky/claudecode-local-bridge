@@ -261,7 +261,7 @@ function parseProviderRouting(
 		skillPolicies: {},
 		familyPolicies: {},
 		providerDefaults: baseDefaults,
-		fallback: `${activeProviderId}/${baseDefaults[activeProviderId] ?? (activeProviderId === 'ollama-chat' ? ollamaModel : 'gpt-5.4')}`,
+		fallback: `${activeProviderId}/${baseDefaults[activeProviderId]}`,
 	}
 
 	const raw = trimToNull(process.env.PROVIDER_ROUTING_JSON)

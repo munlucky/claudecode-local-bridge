@@ -435,6 +435,43 @@ describe('Ollama router integration', () => {
 			}
 		})
 
+		test('prefixes non-active legacy provider models in /v1/models', async () => {
+			const restore = restoreEnv({
+				BRIDGE_BACKEND: 'codex',
+				OLLAMA_BASE_URL: 'http://127.0.0.1:11434',
+			})
+
+			try {
+				restoreFetch(async (input) => {
+					if (String(input).includes('/api/tags')) {
+						return Response.json({
+							models: [{ model: 'qwen3.5:27b' }],
+						})
+					}
+					throw new Error(`unexpected endpoint: ${String(input)}`)
+				})
+
+				const { app } = createApp()
+				const response = await app.fetch(new Request('http://127.0.0.1:3000/v1/models'))
+				const payload = (await response.json()) as {
+					data: Array<{ id: string; name: string; type: string }>
+				}
+
+				expect(response.status).toBe(200)
+				expect(payload.data).toEqual(
+					expect.arrayContaining([
+						{
+							id: 'ollama/qwen3.5:27b',
+							name: 'ollama/qwen3.5:27b',
+							type: 'model',
+						},
+					]),
+				)
+			} finally {
+				restore()
+			}
+		})
+
 		test('routes explicit openai-compatible model ids when configured', async () => {
 			const restore = restoreEnv({
 				BRIDGE_BACKEND: 'codex',

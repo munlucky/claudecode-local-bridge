@@ -73,11 +73,18 @@ function mapObserverToLegacyLogger(
 
 function mapModelEntries(
 	provider: BackendProvider,
+	config: RouterConfig,
 	models: Awaited<ReturnType<BackendProvider['listModels']>>,
 ): CanonicalModelListingEntry[] {
 	return models.map((model) => ({
-		exposedModel: model.id,
-		displayName: model.display_name,
+		exposedModel:
+			provider.providerId === config.activeProviderId
+				? model.id
+				: `${provider.providerId === 'ollama-chat' ? 'ollama' : 'codex'}/${model.id}`,
+		displayName:
+			provider.providerId === config.activeProviderId
+				? model.display_name
+				: `${provider.providerId === 'ollama-chat' ? 'ollama' : 'codex'}/${model.display_name}`,
 		providerId: provider.providerId,
 		providerModel: model.id,
 	}))
@@ -99,7 +106,7 @@ export function createLegacyBackendAdapter(provider: BackendProvider): BridgePro
 		listModels(config: RouterConfig, abortSignal?: AbortSignal | null) {
 			return provider
 				.listModels(config, abortSignal)
-				.then((models) => mapModelEntries(provider, models))
+				.then((models) => mapModelEntries(provider, config, models))
 		},
 		async execute(config, request, context) {
 			const result = await provider.executeNonStream(

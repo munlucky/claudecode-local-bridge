@@ -186,6 +186,11 @@ export function resolveProviderTarget(
 		}
 	}
 
+	const fallback = resolvePolicyTarget(config.providerRouting.fallback, requestedModel, 'fallback')
+	if (fallback && address.type === 'policy') {
+		return fallback
+	}
+
 	const providerDefault = config.providerRouting.providerDefaults[activeProviderId]
 	if (providerDefault && address.type === 'policy') {
 		return {
@@ -203,11 +208,6 @@ export function resolveProviderTarget(
 			exposedModel: requestedModel,
 			resolutionReason: 'legacy-alias',
 		}
-	}
-
-	const fallback = resolvePolicyTarget(config.providerRouting.fallback, requestedModel, 'fallback')
-	if (fallback) {
-		return fallback
 	}
 
 	return {

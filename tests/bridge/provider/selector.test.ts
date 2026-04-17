@@ -90,4 +90,30 @@ describe('provider selector', () => {
 			restore()
 		}
 	})
+
+	test('uses fallback for unresolved policy models before provider default', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			PROVIDER_ROUTING_JSON: JSON.stringify({
+				fallback: 'openai-compatible/gpt-5.4-mini',
+			}),
+		})
+		try {
+			const config = loadConfig()
+
+			expect(
+				resolveProviderTarget(config, {
+					requestedModel: 'skill:missing-policy',
+					requestSource: 'direct-skill',
+				}),
+			).toEqual({
+				providerId: 'openai-compatible',
+				providerModel: 'gpt-5.4-mini',
+				exposedModel: 'skill:missing-policy',
+				resolutionReason: 'fallback',
+			})
+		} finally {
+			restore()
+		}
+	})
 })
