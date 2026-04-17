@@ -19,6 +19,7 @@ export interface ProviderRegistryEntry {
 		streaming: boolean
 		tools: boolean
 		thinking: boolean
+		inputImages: boolean
 		modelListing: boolean
 	}
 }
@@ -43,6 +44,7 @@ export function createProviderRegistry(config: RouterConfig): Map<ProviderRegist
 					streaming: true,
 					tools: true,
 					thinking: true,
+					inputImages: true,
 					modelListing: true,
 				},
 			},
@@ -61,6 +63,7 @@ export function createProviderRegistry(config: RouterConfig): Map<ProviderRegist
 					streaming: false,
 					tools: true,
 					thinking: false,
+					inputImages: false,
 					modelListing: true,
 				},
 			},
@@ -79,6 +82,7 @@ export function createProviderRegistry(config: RouterConfig): Map<ProviderRegist
 					streaming: true,
 					tools: true,
 					thinking: true,
+					inputImages: true,
 					modelListing: true,
 				},
 			},

@@ -48,6 +48,9 @@ export interface RouterResponseTrace {
 	stop_reason?: string | null
 	error_type?: string
 	error_message?: string
+	provider_status?: number | null
+	upstream_request_id?: string | null
+	upstream_error_preview?: string | null
 	codex_model?: string | null
 	usage_output_tokens?: number | null
 	usage_input_tokens?: number | null

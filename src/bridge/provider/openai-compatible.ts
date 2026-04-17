@@ -58,6 +58,27 @@ type OpenAiModelListResponse = {
 	}>
 }
 
+export class OpenAiCompatibleProviderError extends Error {
+	readonly status: number | null
+	readonly requestId: string | null
+	readonly responseBodyPreview: string | null
+
+	constructor(
+		message: string,
+		options?: {
+			status?: number | null
+			requestId?: string | null
+			responseBodyPreview?: string | null
+		},
+	) {
+		super(message)
+		this.name = 'OpenAiCompatibleProviderError'
+		this.status = options?.status ?? null
+		this.requestId = options?.requestId ?? null
+		this.responseBodyPreview = options?.responseBodyPreview ?? null
+	}
+}
+
 function requireBaseUrl(config: RouterConfig) {
 	if (!config.openAiCompatibleBaseUrl) {
 		throw new Error('OPENAI_COMPATIBLE_BASE_URL is required for openai-compatible routing')
@@ -74,6 +95,71 @@ function buildHeaders(config: RouterConfig) {
 					authorization: `Bearer ${config.openAiCompatibleApiKey}`,
 				}
 			: {}),
+	}
+}
+
+function getRequestId(headers: Headers): string | null {
+	return (
+		headers.get('x-request-id')?.trim() ||
+		headers.get('request-id')?.trim() ||
+		headers.get('openai-request-id')?.trim() ||
+		null
+	)
+}
+
+function summarizeBodyPreview(rawBody: string): string | null {
+	const trimmed = rawBody.trim()
+	if (!trimmed) {
+		return null
+	}
+
+	try {
+		const parsed = JSON.parse(trimmed) as {
+			error?: { message?: unknown; code?: unknown; type?: unknown }
+			message?: unknown
+		}
+		if (typeof parsed?.error?.message === 'string' && parsed.error.message.trim()) {
+			return parsed.error.message.trim()
+		}
+		if (typeof parsed?.message === 'string' && parsed.message.trim()) {
+			return parsed.message.trim()
+		}
+	} catch {
+		// Fall back to a trimmed raw preview below.
+	}
+
+	return trimmed.length > 240 ? `${trimmed.slice(0, 237)}...` : trimmed
+}
+
+async function parseJsonBody<T>(
+	response: Response,
+	stage: 'model list' | 'request',
+): Promise<T> {
+	const rawBody = await response.text()
+	if (!rawBody.trim()) {
+		throw new OpenAiCompatibleProviderError(
+			`openai-compatible ${stage} returned an empty response body`,
+			{
+				status: response.status,
+				requestId: getRequestId(response.headers),
+				responseBodyPreview: null,
+			},
+		)
+	}
+
+	try {
+		return JSON.parse(rawBody) as T
+	} catch (error) {
+		throw new OpenAiCompatibleProviderError(
+			`openai-compatible ${stage} returned invalid JSON: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+			{
+				status: response.status,
+				requestId: getRequestId(response.headers),
+				responseBodyPreview: summarizeBodyPreview(rawBody),
+			},
+		)
 	}
 }
 
@@ -289,17 +375,27 @@ function toCanonicalResponse(
 	response: OpenAiChatCompletionResponse,
 ): CanonicalBridgeResponse {
 	const choice = response.choices?.[0]
+	if (!choice) {
+		throw new OpenAiCompatibleProviderError(
+			'openai-compatible response is missing choices[0]',
+		)
+	}
 	const message = choice?.message
+	if (!message) {
+		throw new OpenAiCompatibleProviderError(
+			'openai-compatible response is missing choices[0].message',
+		)
+	}
 	const content: CanonicalBridgeResponse['content'] = []
 
-	if (typeof message?.content === 'string' && message.content) {
+	if (typeof message.content === 'string' && message.content) {
 		content.push({
 			type: 'text',
 			text: message.content,
 		})
 	}
 
-	for (const toolCall of message?.tool_calls ?? []) {
+	for (const toolCall of message.tool_calls ?? []) {
 		content.push({
 			type: 'tool_use',
 			id: toolCall.id ?? `call_${crypto.randomUUID()}`,
@@ -348,9 +444,20 @@ export function createOpenAiCompatibleAdapter(): BridgeProviderAdapter {
 					signal: requestSignal.signal,
 				})
 				if (!response.ok) {
-					throw new Error(`openai-compatible model list failed with status ${response.status}`)
+					const rawBody = await response.text()
+					const preview = summarizeBodyPreview(rawBody)
+					throw new OpenAiCompatibleProviderError(
+						`openai-compatible model list failed with status ${response.status}${
+							preview ? `: ${preview}` : ''
+						}`,
+						{
+							status: response.status,
+							requestId: getRequestId(response.headers),
+							responseBodyPreview: preview,
+						},
+					)
 				}
-				const payload = (await response.json()) as OpenAiModelListResponse
+				const payload = await parseJsonBody<OpenAiModelListResponse>(response, 'model list')
 				return (payload.data ?? [])
 					.map((entry) => entry.id?.trim())
 					.filter((entry): entry is string => Boolean(entry))
@@ -399,9 +506,20 @@ export function createOpenAiCompatibleAdapter(): BridgeProviderAdapter {
 					}),
 				})
 				if (!response.ok) {
-					throw new Error(`openai-compatible request failed with status ${response.status}`)
+					const rawBody = await response.text()
+					const preview = summarizeBodyPreview(rawBody)
+					throw new OpenAiCompatibleProviderError(
+						`openai-compatible request failed with status ${response.status}${
+							preview ? `: ${preview}` : ''
+						}`,
+						{
+							status: response.status,
+							requestId: getRequestId(response.headers),
+							responseBodyPreview: preview,
+						},
+					)
 				}
-				const payload = (await response.json()) as OpenAiChatCompletionResponse
+				const payload = await parseJsonBody<OpenAiChatCompletionResponse>(response, 'request')
 				return toCanonicalResponse(request, payload)
 			} finally {
 				requestSignal.cleanup()

@@ -650,6 +650,160 @@ describe('Ollama router integration', () => {
 			}
 		})
 
+		test('rejects Anthropic thinking on openai-compatible non-stream requests before upstream fetch', async () => {
+			const restore = restoreEnv({
+				BRIDGE_BACKEND: 'codex',
+				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
+				OPENAI_COMPATIBLE_API_KEY: 'test-key',
+			})
+
+			try {
+				restoreFetch(async () => {
+					throw new Error('upstream fetch should not run for unsupported thinking requests')
+				})
+
+				const { app } = createApp()
+				const response = await app.fetch(
+					new Request('http://127.0.0.1:3000/v1/messages', {
+						method: 'POST',
+						headers: {
+							'content-type': 'application/json',
+						},
+						body: JSON.stringify({
+							model: 'openai-compatible/gpt-5.4-mini',
+							max_tokens: 128,
+							thinking: {
+								type: 'enabled',
+								budget_tokens: 64,
+							},
+							messages: [{ role: 'user', content: '짧게 답해줘' }],
+						}),
+					}),
+				)
+				const payload = (await response.json()) as {
+					error?: { message?: string }
+				}
+
+				expect(response.status).toBe(422)
+				expect(payload.error?.message).toContain(
+					"provider 'openai-compatible' does not support Anthropic thinking",
+				)
+			} finally {
+				restore()
+			}
+		})
+
+		test('rejects image content on openai-compatible non-stream requests before upstream fetch', async () => {
+			const restore = restoreEnv({
+				BRIDGE_BACKEND: 'codex',
+				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
+				OPENAI_COMPATIBLE_API_KEY: 'test-key',
+			})
+
+			try {
+				restoreFetch(async () => {
+					throw new Error('upstream fetch should not run for unsupported image requests')
+				})
+
+				const { app } = createApp()
+				const response = await app.fetch(
+					new Request('http://127.0.0.1:3000/v1/messages', {
+						method: 'POST',
+						headers: {
+							'content-type': 'application/json',
+						},
+						body: JSON.stringify({
+							model: 'openai-compatible/gpt-5.4-mini',
+							max_tokens: 128,
+							messages: [
+								{
+									role: 'user',
+									content: [
+										{
+											type: 'image',
+											source: {
+												type: 'base64',
+												media_type: 'image/png',
+												data: 'aGVsbG8=',
+											},
+										},
+									],
+								},
+							],
+						}),
+					}),
+				)
+				const payload = (await response.json()) as {
+					error?: { message?: string }
+				}
+
+				expect(response.status).toBe(422)
+				expect(payload.error?.message).toContain(
+					"provider 'openai-compatible' does not support image content",
+				)
+			} finally {
+				restore()
+			}
+		})
+
+		test('includes upstream error previews for openai-compatible non-stream failures', async () => {
+			const restore = restoreEnv({
+				BRIDGE_BACKEND: 'codex',
+				OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
+				OPENAI_COMPATIBLE_API_KEY: 'test-key',
+			})
+
+			try {
+				restoreFetch(async (input) => {
+					if (String(input) === 'https://example.test/v1/chat/completions') {
+						return Response.json(
+							{
+								error: {
+									message: 'provider rejected the request payload',
+								},
+							},
+							{
+								status: 400,
+								headers: {
+									'x-request-id': 'req_openai_compat_123',
+								},
+							},
+						)
+					}
+					throw new Error(`unexpected endpoint: ${String(input)}`)
+				})
+
+				const { app } = createApp()
+				const response = await app.fetch(
+					new Request('http://127.0.0.1:3000/v1/messages', {
+						method: 'POST',
+						headers: {
+							'content-type': 'application/json',
+						},
+						body: JSON.stringify({
+							model: 'openai-compatible/gpt-5.4-mini',
+							max_tokens: 128,
+							messages: [{ role: 'user', content: '짧게 답해줘' }],
+						}),
+					}),
+				)
+				const payload = (await response.json()) as {
+					error?: { message?: string; raw_message?: string | null }
+				}
+
+				expect(response.status).toBe(502)
+				expect(payload.error?.message).toBe('failed to execute message')
+				expect(payload.error?.raw_message).toContain(
+					'openai-compatible request failed with status 400',
+				)
+				expect(payload.error?.raw_message).toContain(
+					'provider rejected the request payload',
+				)
+			} finally {
+				restore()
+			}
+		})
+
 		test('routes skill policy to openai-compatible without changing legacy defaults', async () => {
 			const restore = restoreEnv({
 				BRIDGE_BACKEND: 'codex',

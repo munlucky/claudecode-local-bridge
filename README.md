@@ -68,6 +68,10 @@ bun run dev
 - `PROVIDER_ROUTING_JSON`으로 skill/family/alias 정책 라우팅 가능
 - `GET /v1/models`는 enabled provider들의 모델을 합쳐 노출하며, non-active provider 모델은 provider-qualified ID로 표시됩니다
 - `openai-compatible` slot은 현재 provider-qualified model listing + non-stream `/v1/messages` 경로를 우선 지원하며 stream 경로는 아직 미구현입니다
+- `openai-compatible` non-stream support matrix:
+  - 지원: text 응답, `tool_calls` -> Anthropic `tool_use`, explicit provider routing, skill-policy routing
+  - 제한: Anthropic `thinking` request config와 image input block은 현재 명시적으로 거절합니다
+  - 제한: stream 요청은 controlled 502로 종료됩니다
 
 ## Claude Code 연결
 
@@ -276,6 +280,7 @@ enabled provider들의 모델 목록을 반환합니다. active provider의 lega
 - `thinking`은 기본적으로 응답 본문에서 제거됩니다.
 - `tool_calls`는 Anthropic `tool_use` 블록으로 정규화됩니다.
 - Ollama 스트리밍은 줄단위 JSON을 Anthropic SSE로 매핑합니다.
+- `openai-compatible` non-stream은 현재 text/tool 중심 경로만 지원하며, unsupported feature는 upstream 호출 전 브리지에서 거절합니다.
 
 ## 프로젝트 구조
 

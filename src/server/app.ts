@@ -11,6 +11,7 @@ import {
 	anthropicRequestToCanonical,
 	canonicalResponseToAnthropic,
 } from '../bridge/canonical/anthropic.js'
+import { OpenAiCompatibleProviderError } from '../bridge/provider/openai-compatible.js'
 import { createProviderRegistry, getProviderRegistryEntry } from '../bridge/provider/registry.js'
 import type { ProviderRegistryEntry } from '../bridge/provider/registry.js'
 import { resolveProviderTarget } from '../bridge/provider/selector.js'
@@ -476,6 +477,53 @@ function buildDirectSkillToolUse(invocation: DirectSkillInvocation): AnthropicTo
 			skill: invocation.skill,
 			...(invocation.args ? { args: invocation.args } : {}),
 		},
+	}
+}
+
+function contentContainsImage(
+	content: AnthropicMessagesRequest['messages'][number]['content'] | AnthropicMessagesRequest['system'],
+): boolean {
+	if (!Array.isArray(content)) {
+		return false
+	}
+
+	return content.some(
+		(block) => block && typeof block === 'object' && block.type === 'image',
+	)
+}
+
+function requestContainsImageBlocks(request: AnthropicMessagesRequest): boolean {
+	if (contentContainsImage(request.system)) {
+		return true
+	}
+
+	return request.messages.some((message) => contentContainsImage(message.content))
+}
+
+function isThinkingEnabled(thinking: AnthropicMessagesRequest['thinking']): boolean {
+	if (!thinking) {
+		return false
+	}
+
+	return thinking.type !== 'disabled'
+}
+
+function validateProviderNonStreamCompatibility(
+	providerEntry: ProviderRegistryEntry,
+	request: AnthropicMessagesRequest,
+) {
+	if (providerEntry.capabilities.thinking === false && isThinkingEnabled(request.thinking)) {
+		throw new AnthropicRequestValidationError(
+			`provider '${providerEntry.id}' does not support Anthropic thinking on non-stream /v1/messages yet`,
+			422,
+		)
+	}
+
+	if (providerEntry.capabilities.inputImages === false && requestContainsImageBlocks(request)) {
+		throw new AnthropicRequestValidationError(
+			`provider '${providerEntry.id}' does not support image content on non-stream /v1/messages yet`,
+			422,
+		)
 	}
 }
 
@@ -973,6 +1021,33 @@ export function createApp(): AppFactoryResult {
 
 		if (!stream) {
 			try {
+				validateProviderNonStreamCompatibility(providerEntry, providerRequest)
+			} catch (error) {
+				const status = error instanceof AnthropicRequestValidationError ? error.statusCode : 422
+				const message =
+					error instanceof Error
+						? error.message
+						: 'request is incompatible with the selected provider'
+				await captureRouterResponse(config, traceContext, {
+					status,
+					duration_ms: Date.now() - startedAt,
+					error_type: 'provider_capability_error',
+					error_message: message,
+				})
+				if (logRequests) {
+					logRouterLine(
+						`POST /v1/messages status=${status} provider_capability_error=${message}`,
+						{
+							config,
+							context: traceContext,
+							stage: 'messages-non-stream',
+						},
+					)
+				}
+				return toErrorResponse(status, message)
+			}
+
+			try {
 				const canonicalRequest = anthropicRequestToCanonical(providerRequest, {
 					source: selectionContext.requestSource,
 					metadata: requestContext,
@@ -1000,11 +1075,22 @@ export function createApp(): AppFactoryResult {
 				return c.json(response, 200)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : 'failed to execute message'
+				const providerStatus =
+					error instanceof OpenAiCompatibleProviderError ? error.status : null
+				const upstreamRequestId =
+					error instanceof OpenAiCompatibleProviderError ? error.requestId : null
+				const upstreamErrorPreview =
+					error instanceof OpenAiCompatibleProviderError
+						? error.responseBodyPreview
+						: null
 				await captureRouterResponse(config, traceContext, {
 					status: 502,
 					duration_ms: Date.now() - startedAt,
 					error_type: 'provider_error',
 					error_message: message,
+					provider_status: providerStatus,
+					upstream_request_id: upstreamRequestId,
+					upstream_error_preview: upstreamErrorPreview,
 				})
 				if (logRequests) {
 					logRouterLine(`POST /v1/messages status=502 non-stream error=${message}`, {
