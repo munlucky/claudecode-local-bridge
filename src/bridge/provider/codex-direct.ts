@@ -262,17 +262,17 @@ function summarizeBodyPreview(rawBody: string): string | null {
 }
 
 function parseSseBlock(block: string) {
-	const lines = block.split('\n')
+	const lines = block.split(/\r?\n/)
 	let event = 'message'
 	const dataLines: string[] = []
 
 	for (const line of lines) {
-		if (line.startsWith('event: ')) {
-			event = line.slice('event: '.length).trim()
+		if (line.startsWith('event:')) {
+			event = line.slice('event:'.length).replace(/^ /, '').trim()
 			continue
 		}
-		if (line.startsWith('data: ')) {
-			dataLines.push(line.slice('data: '.length))
+		if (line.startsWith('data:')) {
+			dataLines.push(line.slice('data:'.length).replace(/^ /, ''))
 		}
 	}
 
@@ -283,6 +283,23 @@ function parseSseBlock(block: string) {
 	return {
 		event,
 		data: dataLines.join('\n'),
+	}
+}
+
+function splitCompleteSseBlocks(buffer: string) {
+	const delimiter = /\r?\n\r?\n/g
+	const blocks: string[] = []
+	let lastIndex = 0
+	let match: RegExpExecArray | null
+
+	while ((match = delimiter.exec(buffer)) !== null) {
+		blocks.push(buffer.slice(lastIndex, match.index))
+		lastIndex = match.index + match[0].length
+	}
+
+	return {
+		blocks,
+		remainder: buffer.slice(lastIndex),
 	}
 }
 
@@ -470,7 +487,7 @@ function parseCodexDirectSseText(
 ): CodexDirectResponsesResponse {
 	try {
 		const payloads: CodexDirectSseEnvelope[] = []
-		for (const part of rawBody.split('\n\n')) {
+		for (const part of splitCompleteSseBlocks(rawBody).blocks) {
 			const parsed = parseSseBlock(part)
 			if (!parsed || parsed.data === '[DONE]') {
 				continue
@@ -518,9 +535,9 @@ async function parseCodexDirectSseResponse(
 			}
 
 			buffer += decoder.decode(value, { stream: true })
-			const parts = buffer.split('\n\n')
-			buffer = parts.pop() ?? ''
-			for (const part of parts) {
+			const { blocks, remainder } = splitCompleteSseBlocks(buffer)
+			buffer = remainder
+			for (const part of blocks) {
 				const parsed = parseSseBlock(part)
 				if (!parsed || parsed.data === '[DONE]') {
 					continue
@@ -1139,9 +1156,11 @@ function buildCodexDirectRequestBody(request: CanonicalBridgeRequest) {
 		store: false,
 		instructions: buildCodexDirectInstructions(request),
 		input: buildOpenAiMessages(request, { includeSystem: false }),
+		// The live Codex backend currently rejects both max_tokens and max_output_tokens.
 		temperature: request.sampling.temperature,
 		top_p: request.sampling.topP,
 		stream: true,
+		// Responses API function tools are flat { type, name, description, parameters } objects.
 		tools:
 			request.tools?.map((tool) => ({
 				type: 'function',
@@ -1705,7 +1724,44 @@ async function streamCodexDirectSseToCanonical(
 		)
 	}
 
+	let pendingFlushTimer:
+		| Promise<{ kind: 'flush' }>
+		| null = null
+	let pendingFlushTimerHandle: ReturnType<typeof setTimeout> | null = null
+
+	const clearPendingFlushTimer = () => {
+		if (pendingFlushTimerHandle) {
+			clearTimeout(pendingFlushTimerHandle)
+			pendingFlushTimerHandle = null
+		}
+		pendingFlushTimer = null
+	}
+
+	const getPendingFlushTimer = () => {
+		if (state.pendingStartPayloads.length === 0 || state.pendingStartBufferedAt == null) {
+			clearPendingFlushTimer()
+			return null
+		}
+		if (pendingFlushTimer) {
+			return pendingFlushTimer
+		}
+
+		const remainingMs = Math.max(
+			0,
+			PRESTART_BUFFER_WINDOW_MS - (Date.now() - state.pendingStartBufferedAt),
+		)
+		pendingFlushTimer = new Promise<{ kind: 'flush' }>((resolve) => {
+			pendingFlushTimerHandle = setTimeout(() => {
+				pendingFlushTimerHandle = null
+				pendingFlushTimer = null
+				resolve({ kind: 'flush' })
+			}, remainingMs)
+		})
+		return pendingFlushTimer
+	}
+
 	const flushPendingStartPayloads = async () => {
+		clearPendingFlushTimer()
 		if (state.pendingStartPayloads.length === 0) {
 			state.pendingStartBufferedAt = null
 			return
@@ -1876,16 +1932,15 @@ async function streamCodexDirectSseToCanonical(
 
 			let nextRead: Awaited<ReturnType<typeof reader.read>>
 			if (state.pendingStartPayloads.length > 0 && state.pendingStartBufferedAt != null) {
-				const remainingMs = Math.max(
-					0,
-					PRESTART_BUFFER_WINDOW_MS - (Date.now() - state.pendingStartBufferedAt),
-				)
 				pendingRead ??= reader.read()
+				const pendingFlush = getPendingFlushTimer()
+				if (!pendingFlush) {
+					await flushPendingStartPayloads()
+					continue
+				}
 				const winner = await Promise.race([
 					pendingRead.then((result) => ({ kind: 'read' as const, result })),
-					new Promise<{ kind: 'flush' }>((resolve) => {
-						setTimeout(() => resolve({ kind: 'flush' }), remainingMs)
-					}),
+					pendingFlush,
 				])
 				if (winner.kind === 'flush') {
 					await flushPendingStartPayloads()
@@ -1904,9 +1959,9 @@ async function streamCodexDirectSseToCanonical(
 			}
 
 			buffer += decoder.decode(value, { stream: true })
-			const parts = buffer.split('\n\n')
-			buffer = parts.pop() ?? ''
-			for (const part of parts) {
+			const { blocks, remainder } = splitCompleteSseBlocks(buffer)
+			buffer = remainder
+			for (const part of blocks) {
 				const parsed = parseSseBlock(part)
 				if (!parsed || parsed.data === '[DONE]') {
 					continue

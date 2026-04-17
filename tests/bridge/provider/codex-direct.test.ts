@@ -294,6 +294,78 @@ test('refreshes expired oauth state and forwards account headers on execute', as
 		])
 	})
 
+	test('uses flat Responses API tool definitions and omits token caps rejected by the direct backend', async () => {
+		const adapter = createCodexDirectAdapter()
+		let capturedBody: Record<string, unknown> | null = null
+
+		restoreFetch(async (input, init) => {
+			if (String(input) === 'https://example.test/backend-api/codex/responses') {
+				capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+				return Response.json({
+					id: 'resp_direct_2_tools',
+					model: 'gpt-5.4-mini',
+					output: [
+						{
+							type: 'message',
+							role: 'assistant',
+							content: [{ type: 'output_text', text: 'ok' }],
+						},
+					],
+					usage: {
+						input_tokens: 10,
+						output_tokens: 5,
+						total_tokens: 15,
+					},
+				})
+			}
+
+			throw new Error(`unexpected endpoint: ${String(input)}`)
+		})
+
+		await adapter.execute(
+			{
+				...baseConfig,
+				codexDirectAuthMode: 'api_key',
+				codexOpenAiApiKey: 'test-key',
+			},
+			{
+				...baseRequest,
+				tools: [
+					{
+						name: 'Read',
+						description: 'Read a file',
+						input_schema: {
+							type: 'object',
+							properties: {
+								file_path: { type: 'string' },
+							},
+							required: ['file_path'],
+							additionalProperties: false,
+						},
+					},
+				],
+			},
+		)
+
+		expect(capturedBody?.tools).toEqual([
+			{
+				type: 'function',
+				name: 'Read',
+				description: 'Read a file',
+				parameters: {
+					type: 'object',
+					properties: {
+						file_path: { type: 'string' },
+					},
+					required: ['file_path'],
+					additionalProperties: false,
+				},
+			},
+		])
+		expect('max_tokens' in (capturedBody ?? {})).toBe(false)
+		expect('max_output_tokens' in (capturedBody ?? {})).toBe(false)
+	})
+
 	test('maps non-stream function_call output into canonical tool_use content', async () => {
 		const adapter = createCodexDirectAdapter()
 		restoreFetch(async (input) => {
@@ -528,6 +600,43 @@ test('refreshes expired oauth state and forwards account headers on execute', as
 		expect(response.usage.totalTokens).toBe(12)
 	})
 
+	test('parses CRLF-delimited SSE frames and data fields without a trailing space', async () => {
+		const adapter = createCodexDirectAdapter()
+
+		restoreFetch(async (input) => {
+			if (String(input) === 'https://example.test/backend-api/codex/responses') {
+				return new Response(
+					[
+						'event: response.completed',
+						'data:{"type":"response.completed","response":{"id":"resp_sse_crlf_1","model":"gpt-5.4-mini","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"crlf stream"}]}],"usage":{"input_tokens":8,"output_tokens":4,"total_tokens":12}}}',
+						'',
+						'data:[DONE]',
+						'',
+					].join('\r\n'),
+					{
+						headers: {
+							'content-type': 'text/event-stream',
+						},
+					},
+				)
+			}
+
+			throw new Error(`unexpected endpoint: ${String(input)}`)
+		})
+
+		const response = await adapter.execute(
+			{
+				...baseConfig,
+				codexDirectAuthMode: 'api_key',
+				codexOpenAiApiKey: 'test-key',
+			},
+			baseRequest,
+		)
+
+		expect(response.content).toEqual([{ type: 'text', text: 'crlf stream' }])
+		expect(response.usage.totalTokens).toBe(12)
+	})
+
 	test('merges output_text deltas when response.completed omits assistant content', async () => {
 		const adapter = createCodexDirectAdapter()
 
@@ -631,6 +740,111 @@ test('refreshes expired oauth state and forwards account headers on execute', as
 			{
 				type: 'message_start',
 				messageId: 'resp_stream_1',
+				model: 'gpt-5.4-mini',
+				usage: {
+					inputTokens: 0,
+					outputTokens: 0,
+					cachedInputTokens: 0,
+					reasoningOutputTokens: 0,
+					totalTokens: 0,
+				},
+			},
+			{
+				type: 'content_block_start',
+				index: 0,
+				contentBlock: {
+					type: 'text',
+					text: '',
+				},
+			},
+			{
+				type: 'content_block_delta',
+				index: 0,
+				delta: {
+					type: 'text_delta',
+					text: 'hello',
+				},
+			},
+			{
+				type: 'content_block_stop',
+				index: 0,
+			},
+			{
+				type: 'message_delta',
+				stopReason: 'end_turn',
+				stopSequence: null,
+				usage: {
+					inputTokens: 4,
+					outputTokens: 2,
+					cachedInputTokens: 0,
+					reasoningOutputTokens: 0,
+					totalTokens: 6,
+				},
+			},
+			{
+				type: 'message_stop',
+			},
+		])
+	})
+
+	test('streams CRLF-delimited SSE frames and accepts data fields without a trailing space', async () => {
+		const adapter = createCodexDirectAdapter()
+
+		restoreFetch(async (input) => {
+			if (String(input) === 'https://example.test/backend-api/codex/responses') {
+				return new Response(
+					new ReadableStream({
+						start(controller) {
+							const encoder = new TextEncoder()
+							controller.enqueue(
+								encoder.encode(
+									[
+										'event: response.created',
+										'data:{"type":"response.created","response":{"id":"resp_stream_crlf_1","model":"gpt-5.4-mini"}}',
+										'',
+										'event: response.output_text.delta',
+										'data:{"type":"response.output_text.delta","item_id":"msg_crlf_1","delta":"hello"}',
+										'',
+										'event: response.completed',
+										'data:{"type":"response.completed","response":{"id":"resp_stream_crlf_1","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}',
+										'',
+										'data:[DONE]',
+										'',
+									].join('\r\n'),
+								),
+							)
+							controller.close()
+						},
+					}),
+					{
+						headers: {
+							'content-type': 'text/event-stream',
+						},
+					},
+				)
+			}
+
+			throw new Error(`unexpected endpoint: ${String(input)}`)
+		})
+
+		const events = await collectCanonicalStream(
+			adapter.stream(
+				{
+					...baseConfig,
+					codexDirectAuthMode: 'api_key',
+					codexOpenAiApiKey: 'test-key',
+				},
+				{
+					...baseRequest,
+					stream: true,
+				},
+			),
+		)
+
+		expect(events).toEqual([
+			{
+				type: 'message_start',
+				messageId: 'resp_stream_crlf_1',
 				model: 'gpt-5.4-mini',
 				usage: {
 					inputTokens: 0,
