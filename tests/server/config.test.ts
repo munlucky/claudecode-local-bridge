@@ -119,4 +119,54 @@ describe('loadConfig', () => {
 		expect(config.ollamaModelAliases['claude-sonnet-4-5-20250929']).toBe('qwen3.5:27b')
 		restore()
 	})
+
+	test('parses provider routing policy override', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			PROVIDER_ROUTING_JSON: JSON.stringify({
+				aliases: {
+					fast: 'ollama/qwen3.5:27b',
+				},
+				skillPolicies: {
+					review: 'ollama/qwen3.5:27b',
+				},
+				familyPolicies: {
+					reasoning: 'ollama/qwen3.5:27b',
+				},
+				providerDefaults: {
+					'codex-app-server': 'gpt-5.4',
+					'ollama-chat': 'qwen3.5:27b',
+				},
+				fallback: 'ollama/qwen3.5:27b',
+			}),
+		})
+
+		const config = loadConfig()
+
+		expect(config.activeProviderId).toBe('codex-app-server')
+		expect(config.providerRouting.aliases.fast).toBe('ollama/qwen3.5:27b')
+		expect(config.providerRouting.skillPolicies.review).toBe('ollama/qwen3.5:27b')
+		expect(config.providerRouting.familyPolicies.reasoning).toBe('ollama/qwen3.5:27b')
+		expect(config.providerRouting.providerDefaults['codex-app-server']).toBe('gpt-5.4')
+		expect(config.providerRouting.fallback).toBe('ollama/qwen3.5:27b')
+		restore()
+	})
+
+	test('parses openai-compatible env and leaves legacy backend default unchanged', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			OPENAI_COMPATIBLE_BASE_URL: 'https://example.test',
+			OPENAI_COMPATIBLE_API_KEY: 'test-key',
+			OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS: '45000',
+		})
+
+		const config = loadConfig()
+
+		expect(config.bridgeBackend).toBe('codex')
+		expect(config.activeProviderId).toBe('codex-app-server')
+		expect(config.openAiCompatibleBaseUrl).toBe('https://example.test')
+		expect(config.openAiCompatibleApiKey).toBe('test-key')
+		expect(config.openAiCompatibleRequestTimeoutMs).toBe(45000)
+		restore()
+	})
 })

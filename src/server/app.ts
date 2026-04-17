@@ -1,9 +1,19 @@
 import { existsSync } from 'node:fs'
 import { Hono } from 'hono'
 import { z } from 'zod'
+import {
+	formatAnthropicSse,
+	renderCanonicalStreamAsAnthropicSse,
+} from '../bridge/anthropic/surface.js'
 import { checkCodexAuthDependency, getCodexBridgeRuntimeSnapshot } from '../bridge/codex/index.js'
-import { createBackendProvider } from '../bridge/backend-provider.js'
 import { AnthropicRequestValidationError, validateAnthropicRequestSemantics } from '../bridge/anthropic/index.js'
+import {
+	anthropicRequestToCanonical,
+	canonicalResponseToAnthropic,
+} from '../bridge/canonical/anthropic.js'
+import { createProviderRegistry, getProviderRegistryEntry } from '../bridge/provider/registry.js'
+import type { ProviderRegistryEntry } from '../bridge/provider/registry.js'
+import { resolveProviderTarget } from '../bridge/provider/selector.js'
 import {
 	RouterTraceContext,
 	buildRouterTraceContext,
@@ -147,15 +157,61 @@ function toErrorResponse(status: number, message: string, rawMessage?: string) {
 	)
 }
 
-function formatRouterModelList(models: { id: string; display_name: string }[]) {
+function formatRouterModelList(models: Array<{ exposedModel: string; displayName: string }>) {
 	return {
 		data: models.map((entry) => ({
 			type: 'model',
-			id: entry.id,
-			name: entry.display_name,
+			id: entry.exposedModel,
+			name: entry.displayName,
 		})),
 		object: 'list',
 	}
+}
+
+async function listVisibleModels(
+	config: RouterConfig,
+	providerRegistry: Map<ProviderRegistryEntry['id'], ProviderRegistryEntry>,
+	activeProviderId: ProviderRegistryEntry['id'],
+	abortSignal?: AbortSignal | null,
+) {
+	const activeProvider = getProviderRegistryEntry(providerRegistry, activeProviderId)
+	const optionalProviders = Array.from(providerRegistry.values()).filter(
+		(entry) => entry.id !== activeProviderId && entry.enabled && entry.capabilities.modelListing,
+	)
+
+	const visibleModels = new Map<string, { exposedModel: string; displayName: string }>()
+	const activeModels = await activeProvider.adapter.listModels(config, abortSignal)
+	for (const model of activeModels) {
+		visibleModels.set(model.exposedModel, {
+			exposedModel: model.exposedModel,
+			displayName: model.displayName,
+		})
+	}
+
+	for (const provider of optionalProviders) {
+		try {
+			const models = await provider.adapter.listModels(config, abortSignal)
+			for (const model of models) {
+				if (!visibleModels.has(model.exposedModel)) {
+					visibleModels.set(model.exposedModel, {
+						exposedModel: model.exposedModel,
+						displayName: model.displayName,
+					})
+				}
+			}
+		} catch (error) {
+			if (config.logRequests) {
+				logRouterLine(
+					`GET /v1/models optional_provider_error provider=${provider.id} error=${
+						error instanceof Error ? error.message : String(error)
+					}`,
+					{ config, stage: 'models' },
+				)
+			}
+		}
+	}
+
+	return Array.from(visibleModels.values())
 }
 
 function toStreamHeaders(): HeadersInit {
@@ -320,6 +376,97 @@ function detectDirectSkillInvocation(request: AnthropicMessagesRequest): DirectS
 	return null
 }
 
+function extractActiveSkillName(request: AnthropicMessagesRequest): string | null {
+	for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+		const message = request.messages[index]
+		if (!message || message.role !== 'assistant' || !Array.isArray(message.content)) {
+			continue
+		}
+
+		for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+			const block = message.content[blockIndex]
+			if (
+				!block ||
+				typeof block !== 'object' ||
+				block.type !== 'tool_use' ||
+				block.name !== 'Skill' ||
+				!block.input ||
+				typeof block.input !== 'object' ||
+				Array.isArray(block.input)
+			) {
+				continue
+			}
+
+			const skill = (block.input as Record<string, unknown>).skill
+			if (typeof skill === 'string' && skill.trim()) {
+				return skill.trim()
+			}
+		}
+	}
+
+	return null
+}
+
+function detectModelSelectionContext(
+	request: AnthropicMessagesRequest,
+	directSkillInvocation: DirectSkillInvocation | null,
+) {
+	if (directSkillInvocation) {
+		return {
+			requestSource: 'direct-skill' as const,
+			skillName: directSkillInvocation.skill,
+		}
+	}
+
+	if (request.model.trim().startsWith('skill:')) {
+		return {
+			requestSource: 'direct-skill' as const,
+			skillName: request.model.trim().slice('skill:'.length).trim() || null,
+		}
+	}
+
+	const priorSkill = extractActiveSkillName(request)
+	if (priorSkill) {
+		return {
+			requestSource: 'tool-loop' as const,
+			skillName: priorSkill,
+		}
+	}
+
+	return {
+		requestSource: 'anthropic-route' as const,
+		skillName: null,
+	}
+}
+
+function applyProviderModelToRequest(
+	request: AnthropicMessagesRequest,
+	providerModel: string,
+): AnthropicMessagesRequest {
+	if (request.model === providerModel) {
+		return request
+	}
+
+	return {
+		...request,
+		model: providerModel,
+	}
+}
+
+function overrideResponseModel(
+	response: AnthropicMessagesResponse,
+	exposedModel: string,
+): AnthropicMessagesResponse {
+	if (response.model === exposedModel) {
+		return response
+	}
+
+	return {
+		...response,
+		model: exposedModel,
+	}
+}
+
 function buildDirectSkillToolUse(invocation: DirectSkillInvocation): AnthropicToolUseBlock {
 	return {
 		type: 'tool_use',
@@ -352,7 +499,7 @@ function buildDirectSkillResponse(
 }
 
 function formatSyntheticSse(event: string, payload: unknown): Uint8Array {
-	return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
+	return formatAnthropicSse(event, payload)
 }
 
 function createDirectSkillStream(
@@ -526,7 +673,8 @@ export function createApp(): AppFactoryResult {
 	const config = loadConfig()
 	const hasCodexAuthFile = config.codexAuthMode === 'local_auth_json' ? existsSync(config.codexAuthFile) : false
 	const app = new Hono()
-	const provider = createBackendProvider(config)
+	const providerRegistry = createProviderRegistry(config)
+	const activeProvider = getProviderRegistryEntry(providerRegistry, config.activeProviderId)
 	const logRequests = config.logRequests
 
 	app.get('/health', async (c) => {
@@ -589,7 +737,12 @@ export function createApp(): AppFactoryResult {
 			headers: c.req.raw.headers,
 		})
 		try {
-			const models = await provider.listModels(config, c.req.raw.signal)
+			const models = await listVisibleModels(
+				config,
+				providerRegistry,
+				activeProvider.id,
+				c.req.raw.signal,
+			)
 			const responsePayload = formatRouterModelList(models)
 			if (config.captureResponses) {
 				await captureRouterResponse(config, requestContext, {
@@ -598,7 +751,7 @@ export function createApp(): AppFactoryResult {
 				})
 			}
 			if (logRequests) {
-				logRouterLine(`GET /v1/models status=200 provider=${config.bridgeBackend}`, {
+				logRouterLine(`GET /v1/models status=200 provider=${activeProvider.id}`, {
 					config,
 					context: requestContext,
 					stage: 'models',
@@ -713,6 +866,7 @@ export function createApp(): AppFactoryResult {
 		}
 		const stream = request.stream === true
 		const directSkillInvocation = detectDirectSkillInvocation(request)
+		const selectionContext = detectModelSelectionContext(request, directSkillInvocation)
 
 		if (directSkillInvocation) {
 			const toolInputSummary = summarizeToolInputForCapture({
@@ -787,25 +941,63 @@ export function createApp(): AppFactoryResult {
 			})
 		}
 
+		let selectedTarget: ReturnType<typeof resolveProviderTarget>
+		let providerEntry: ReturnType<typeof getProviderRegistryEntry>
+		let providerRequest: AnthropicMessagesRequest
+		try {
+			selectedTarget = resolveProviderTarget(config, {
+				requestedModel: request.model,
+				requestSource: selectionContext.requestSource,
+				skillName: selectionContext.skillName,
+				activeProviderId: config.activeProviderId,
+			})
+			providerEntry = getProviderRegistryEntry(providerRegistry, selectedTarget.providerId)
+			providerRequest = applyProviderModelToRequest(request, selectedTarget.providerModel)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'failed to resolve provider route'
+			await captureRouterResponse(config, traceContext, {
+				status: 502,
+				duration_ms: Date.now() - startedAt,
+				error_type: 'selector_error',
+				error_message: message,
+			})
+			if (logRequests) {
+				logRouterLine(`POST /v1/messages status=502 selector_error=${message}`, {
+					config,
+					context: traceContext,
+					stage: 'messages-selector',
+				})
+			}
+			return toErrorResponse(502, 'failed to resolve provider route', message)
+		}
+
 		if (!stream) {
 			try {
-				const result = await provider.executeNonStream(config, request, requestContext)
+				const canonicalRequest = anthropicRequestToCanonical(providerRequest, {
+					source: selectionContext.requestSource,
+					metadata: requestContext,
+				})
+				const result = await providerEntry.adapter.execute(config, canonicalRequest, requestContext)
+				const response = overrideResponseModel(
+					canonicalResponseToAnthropic(result),
+					selectedTarget.exposedModel,
+				)
 				await captureRouterResponse(config, traceContext, {
 					status: 200,
 					duration_ms: Date.now() - startedAt,
-					stop_reason: result.response.stop_reason,
-					...pickUsageForCapture(result.response.usage),
-					prompt_metrics: result.promptMetrics,
-					codex_model: result.response.model,
+					stop_reason: response.stop_reason,
+					...pickUsageForCapture(response.usage),
+					prompt_metrics: result.promptMetrics as CodexPromptMetrics | undefined,
+					codex_model: response.model,
 				})
 				if (logRequests) {
-					logRouterLine(`POST /v1/messages status=200 non-stream model=${result.response.model}`, {
+					logRouterLine(`POST /v1/messages status=200 non-stream model=${response.model} provider=${providerEntry.id}`, {
 						config,
 						context: traceContext,
 						stage: 'messages-non-stream',
 					})
 				}
-				return c.json(result.response, 200)
+				return c.json(response, 200)
 			} catch (error) {
 				const message = error instanceof Error ? error.message : 'failed to execute message'
 				await captureRouterResponse(config, traceContext, {
@@ -826,11 +1018,17 @@ export function createApp(): AppFactoryResult {
 		}
 
 		let onCompleteTriggered = false
-		const streamResponse = provider.createStream(
-			config,
-			request,
-			requestContext,
-			{
+		const canonicalRequest = anthropicRequestToCanonical(providerRequest, {
+			source: selectionContext.requestSource,
+			metadata: requestContext,
+		})
+		let canonicalStream: ReturnType<typeof providerEntry.adapter.stream>
+		try {
+			canonicalStream = providerEntry.adapter.stream(
+				config,
+				canonicalRequest,
+				requestContext,
+				{
 				onSessionReady: () => {
 					void captureRouterStreamEvent(
 						config,
@@ -842,7 +1040,7 @@ export function createApp(): AppFactoryResult {
 						},
 					)
 					if (logRequests) {
-						logRouterLine(`POST /v1/messages stream started provider=${config.bridgeBackend}`, {
+						logRouterLine(`POST /v1/messages stream started provider=${providerEntry.id}`, {
 							config,
 							context: traceContext,
 							stage: 'messages-stream',
@@ -915,10 +1113,30 @@ export function createApp(): AppFactoryResult {
 						},
 					)
 				},
-			},
-		)
+				},
+			)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'failed to start stream'
+			await captureRouterResponse(config, traceContext, {
+				status: 502,
+				duration_ms: Date.now() - startedAt,
+				error_type: 'provider_stream_setup_error',
+				error_message: message,
+			})
+			if (logRequests) {
+				logRouterLine(`POST /v1/messages status=502 stream_setup_error=${message}`, {
+					config,
+					context: traceContext,
+					stage: 'messages-stream',
+				})
+			}
+			return toErrorResponse(502, 'failed to start stream', message)
+		}
+		const clientStream = renderCanonicalStreamAsAnthropicSse(canonicalStream, {
+			exposedModel: selectedTarget.exposedModel,
+		})
 
-		return new Response(streamResponse, {
+		return new Response(clientStream, {
 			status: 200,
 			headers: toStreamHeaders(),
 		})

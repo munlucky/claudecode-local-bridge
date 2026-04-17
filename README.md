@@ -13,6 +13,8 @@
 - Codex 응답을 Anthropic 호환 JSON 및 SSE 스트림으로 재구성
 - Claude Code의 `tool_use` / `tool_result` 루프 유지
 - Anthropic 모델 ID를 Codex 모델로 매핑
+- selector 기반 `provider/model` 라우팅 지원
+- optional `openai-compatible` provider slot 지원
 
 ## 요구 사항
 
@@ -59,6 +61,13 @@ bun run dev
 
 - `BRIDGE_BACKEND=codex` (기본): 기존 로컬 Codex 앱서버 사용
 - `BRIDGE_BACKEND=ollama`: Ollama API 기반 사용 (`/api/tags`, `/api/chat`)
+
+추가 provider routing:
+
+- `provider/model` 형식(`ollama/qwen3.5:27b`, `openai-compatible/gpt-5.4-mini`)으로 명시 라우팅 가능
+- `PROVIDER_ROUTING_JSON`으로 skill/family/alias 정책 라우팅 가능
+- `GET /v1/models`는 enabled provider들의 모델을 합쳐 노출하며, non-active provider 모델은 provider-qualified ID로 표시됩니다
+- `openai-compatible` slot은 현재 provider-qualified model listing + non-stream `/v1/messages` 경로를 우선 지원하며 stream 경로는 아직 미구현입니다
 
 ## Claude Code 연결
 
@@ -122,6 +131,26 @@ node scripts/verify-ollama-bridge.mjs --base http://127.0.0.1:3000 --model qwen3
 | `OLLAMA_SHOW_THINKING` | `0` | `message.thinking` 응답 포함 여부 (`1`이면 포함) |
 | `OLLAMA_MODEL_ALIASES_JSON` | 미설정 | Anthropic/Ollama 요청 모델명과 실제 Ollama 모델명 매핑 |
 | `MODEL_ALIASES_JSON` | 미설정 | Anthropic 모델 ID와 Codex 모델 매핑 덮어쓰기 |
+| `PROVIDER_ROUTING_JSON` | 미설정 | skill/family/alias 기반 provider routing 정책 JSON |
+| `OPENAI_COMPATIBLE_BASE_URL` | 미설정 | OpenAI-compatible provider base URL (`/v1/models`, `/v1/chat/completions`) |
+| `OPENAI_COMPATIBLE_API_KEY` | 미설정 | OpenAI-compatible provider API 키 |
+| `OPENAI_COMPATIBLE_REQUEST_TIMEOUT_MS` | `120000` | OpenAI-compatible `/v1/models`, `/v1/chat/completions` 요청 타임아웃(ms) |
+
+`PROVIDER_ROUTING_JSON` 예시:
+
+```json
+{
+  "aliases": {
+    "fast": "openai-compatible/gpt-5.4-mini"
+  },
+  "skillPolicies": {
+    "review": "openai-compatible/gpt-5.4-mini"
+  },
+  "providerDefaults": {
+    "openai-compatible": "gpt-5.4-mini"
+  }
+}
+```
 
 디버그 로그와 요청/응답 캡처는 기본적으로 활성화되어 있습니다. `.history/` 아래에 로컬 추적 파일을 남기고 싶지 않다면 다음 값을 끄면 됩니다.
 
@@ -217,7 +246,7 @@ Ollama backend에서는 `ollama_base_url`, `ollama_model`, `has_ollama_api_key`,
 
 ### `GET /v1/models`
 
-현재 브리지에 매핑된 Anthropic 모델 ID 목록을 반환합니다.
+enabled provider들의 모델 목록을 반환합니다. active provider의 legacy 모델 ID는 그대로 노출되고, 추가 provider 모델은 `openai-compatible/gpt-5.4-mini` 같은 provider-qualified ID로 노출됩니다.
 
 ### `POST /v1/messages`
 

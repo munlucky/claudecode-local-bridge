@@ -5,6 +5,10 @@ import type {
 	AnthropicResponseContentBlock,
 	CodexPromptMetrics,
 } from '../shared/index.js'
+import type {
+	CanonicalProviderId,
+	CanonicalStopReason,
+} from './canonical/types.js'
 import { listOllamaModels, runOllamaTurn, streamOllamaTurn } from './ollama/index.js'
 import { createCodexAnthropicStream, executeCodexTurn, getCodexBridgeRuntimeSnapshot } from './codex/index.js'
 import { mapCodexResultToAnthropic } from './anthropic/index.js'
@@ -15,7 +19,9 @@ export interface BackendModelEntry {
 	display_name: string
 }
 
-type OllamaUsage = {
+type LegacyBackendId = Extract<CanonicalProviderId, 'codex-app-server' | 'ollama-chat'>
+
+type StreamCompleteUsage = {
 	input_tokens: number
 	output_tokens: number
 	total_tokens: number
@@ -24,8 +30,8 @@ type OllamaUsage = {
 }
 
 type StreamCompletePayload = {
-	stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | null
-	usage: OllamaUsage
+	stopReason: CanonicalStopReason
+	usage: StreamCompleteUsage
 	promptMetrics?: {
 		userMessageCount: number
 		totalMessageCount: number
@@ -71,6 +77,7 @@ export interface BackendNonStreamResult {
 
 export interface BackendProvider {
 	backend: 'codex_app_server' | 'ollama_api'
+	providerId: LegacyBackendId
 	listModels(
 		config: RouterConfig,
 		abortSignal?: AbortSignal | null,
@@ -98,9 +105,10 @@ export interface BackendProvider {
 	): ReadableStream<Uint8Array>
 }
 
-function createCodexProvider(): BackendProvider {
+export function createCodexProvider(): BackendProvider {
 	return {
 		backend: 'codex_app_server',
+		providerId: 'codex-app-server',
 		listModels(config): Promise<BackendModelEntry[]> {
 			const aliases = Object.keys(config.modelAliases)
 			return Promise.resolve(
@@ -138,9 +146,10 @@ function createCodexProvider(): BackendProvider {
 	}
 }
 
-function createOllamaProvider(): BackendProvider {
+export function createOllamaProvider(): BackendProvider {
 	return {
 		backend: 'ollama_api',
+		providerId: 'ollama-chat',
 		listModels(config, abortSignal): Promise<BackendModelEntry[]> {
 			return listOllamaModels(config, abortSignal).then((models) =>
 				models.map((model) => ({
@@ -173,8 +182,12 @@ function createOllamaProvider(): BackendProvider {
 	}
 }
 
+export function createBackendProviderById(providerId: LegacyBackendId): BackendProvider {
+	return providerId === 'ollama-chat' ? createOllamaProvider() : createCodexProvider()
+}
+
 export function createBackendProvider(config: RouterConfig): BackendProvider {
-	return config.bridgeBackend === 'ollama' ? createOllamaProvider() : createCodexProvider()
+	return createBackendProviderById(config.activeProviderId)
 }
 
 export function getCodexBackendHealthSnapshot() {

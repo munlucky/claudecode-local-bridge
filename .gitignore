@@ -118,7 +118,8 @@ tokens.json
 
 # Local AI/assistant workspace state
 .claude
-.agents/
+.agents
+.codex
 .history/
 .bridge-logs/
 AGENTS.md
@@ -135,4 +136,5 @@ bun.lock
 docs
 workflow
 claude-code-main
+opencode
 .bridge-qa
