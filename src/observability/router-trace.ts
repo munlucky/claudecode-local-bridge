@@ -50,6 +50,7 @@ export interface RouterResponseTrace {
 	error_message?: string
 	provider_status?: number | null
 	upstream_request_id?: string | null
+	upstream_response_id?: string | null
 	upstream_error_preview?: string | null
 	codex_model?: string | null
 	usage_output_tokens?: number | null
@@ -224,6 +225,7 @@ export async function captureRouterStreamEvent(
 		status: number
 		stream_end_reason?: string | null
 		error_message?: string
+		upstream_response_id?: string | null
 		codex_model?: string | null
 		conversation_id?: string | null
 		workspace_root?: string | null

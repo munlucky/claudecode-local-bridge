@@ -97,12 +97,18 @@ export async function ensureRuntimeLogSession(config: RouterConfig) {
 			listen_host: config.listenHost,
 			listen_port: config.listenPort,
 			backend: config.bridgeBackend,
+			active_provider_id: config.activeProviderId,
 			...(config.bridgeBackend === 'codex'
 				? {
 						codex_command: config.codexCommand,
 						codex_auth_mode: config.codexAuthMode,
 						codex_auth_file: config.codexAuthFile,
 						codex_runtime_cwd: config.codexRuntimeCwd,
+						codex_direct_enabled: config.codexDirectEnabled,
+						codex_direct_rollout: config.codexDirectRollout,
+						codex_direct_auth_mode: config.codexDirectAuthMode,
+						codex_direct_auth_state_file: config.codexDirectAuthStateFile,
+						codex_direct_base_url: config.codexDirectBaseUrl,
 					}
 				: {
 						ollama_base_url: config.ollamaBaseUrl,

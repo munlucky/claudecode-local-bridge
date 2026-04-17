@@ -227,8 +227,8 @@ export type BridgeBackend = 'codex' | 'ollama'
 
 export interface RouterHealthResponse {
 	status: 'ok'
-	backend: 'codex_app_server' | 'ollama_api'
-	auth_mode?: 'api_key' | 'account' | 'local_auth_json' | 'disabled'
+	backend: 'codex_app_server' | 'codex_direct_api' | 'ollama_api'
+	auth_mode?: 'api_key' | 'account' | 'local_auth_json' | 'disabled' | 'oauth' | 'auto'
 	has_auth_mode_dependency?: boolean
 	live?: boolean
 	readiness?: 'ready' | 'degraded'
@@ -244,6 +244,11 @@ export interface RouterHealthResponse {
 	codex_auth_file?: string
 	has_local_auth_file?: boolean
 	codex_model?: string | null
+	codex_direct_auth_state_file?: string
+	has_codex_direct_auth_state?: boolean
+	codex_direct_auth_state?: 'ready' | 'refreshable' | 'expired' | 'missing'
+	codex_direct_base_url?: string | null
+	codex_direct_rollout?: 'disabled' | 'shadow' | 'prefer-direct'
 
 	ollama_base_url?: string
 	ollama_model?: string

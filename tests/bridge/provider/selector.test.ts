@@ -35,6 +35,11 @@ describe('provider selector', () => {
 			providerId: 'ollama-chat',
 			modelId: 'qwen3.5:27b',
 		})
+		expect(parseModelAddress('codex-direct/gpt-5.4')).toEqual({
+			type: 'qualified',
+			providerId: 'codex-direct',
+			modelId: 'gpt-5.4',
+		})
 	})
 
 	test('keeps legacy Anthropic ids on the active codex path by default', () => {
@@ -111,6 +116,31 @@ describe('provider selector', () => {
 				providerModel: 'gpt-5.4-mini',
 				exposedModel: 'skill:missing-policy',
 				resolutionReason: 'fallback',
+			})
+		} finally {
+			restore()
+		}
+	})
+
+	test('keeps codex-direct qualified routing distinct from legacy codex path', () => {
+		const restore = withEnv({
+			BRIDGE_BACKEND: 'codex',
+			CODEX_DIRECT_ENABLED: '1',
+			CODEX_DIRECT_ROLLOUT: 'shadow',
+		})
+		try {
+			const config = loadConfig()
+
+			expect(
+				resolveProviderTarget(config, {
+					requestedModel: 'codex-direct/gpt-5.4-mini',
+					requestSource: 'anthropic-route',
+				}),
+			).toEqual({
+				providerId: 'codex-direct',
+				providerModel: 'gpt-5.4-mini',
+				exposedModel: 'codex-direct/gpt-5.4-mini',
+				resolutionReason: 'qualified',
 			})
 		} finally {
 			restore()

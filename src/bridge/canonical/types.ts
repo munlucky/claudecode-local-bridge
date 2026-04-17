@@ -4,7 +4,11 @@ import type {
 	JsonValue,
 } from '../../shared/index.js'
 
-export type CanonicalProviderId = 'codex-app-server' | 'ollama-chat' | 'openai-compatible'
+export type CanonicalProviderId =
+	| 'codex-app-server'
+	| 'codex-direct'
+	| 'ollama-chat'
+	| 'openai-compatible'
 
 export type CanonicalRequestSource =
 	| 'anthropic-route'

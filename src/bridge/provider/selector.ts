@@ -41,6 +41,7 @@ export interface SkillAwareResolveResult {
 const PROVIDER_ID_ALIASES: Record<string, CanonicalProviderId> = {
 	codex: 'codex-app-server',
 	'codex-app-server': 'codex-app-server',
+	'codex-direct': 'codex-direct',
 	ollama: 'ollama-chat',
 	'ollama-chat': 'ollama-chat',
 	'openai-compatible': 'openai-compatible',
@@ -99,6 +100,7 @@ function resolveLegacyModelForProvider(
 ): string {
 	switch (providerId) {
 		case 'codex-app-server':
+		case 'codex-direct':
 			return resolveModelAlias(config, requestedModel)
 		case 'ollama-chat':
 			return config.ollamaModelAliases[requestedModel] ?? config.ollamaModel

@@ -4,6 +4,7 @@ import {
 	createBackendProviderById,
 } from '../backend-provider.js'
 import type { BridgeProviderAdapter } from './contract.js'
+import { createCodexDirectAdapter } from './codex-direct.js'
 import { createLegacyBackendAdapter } from './legacy-adapter.js'
 import { createOpenAiCompatibleAdapter } from './openai-compatible.js'
 
@@ -26,6 +27,7 @@ export interface ProviderRegistryEntry {
 
 export function createProviderRegistry(config: RouterConfig): Map<ProviderRegistryEntry['id'], ProviderRegistryEntry> {
 	const codexProvider = createBackendProviderById('codex-app-server')
+	const codexDirectProvider = createCodexDirectAdapter()
 	const ollamaProvider = createBackendProviderById('ollama-chat')
 	const openAiCompatibleProvider = createOpenAiCompatibleAdapter()
 
@@ -45,6 +47,25 @@ export function createProviderRegistry(config: RouterConfig): Map<ProviderRegist
 					tools: true,
 					thinking: true,
 					inputImages: true,
+					modelListing: true,
+				},
+			},
+		],
+		[
+			'codex-direct',
+			{
+				id: 'codex-direct',
+				enabled: config.codexDirectEnabled,
+				adapter: codexDirectProvider,
+				defaults: {
+					model: config.providerRouting.providerDefaults['codex-direct'],
+				},
+				aliases: config.modelAliases,
+				capabilities: {
+					streaming: true,
+					tools: true,
+					thinking: false,
+					inputImages: false,
 					modelListing: true,
 				},
 			},
